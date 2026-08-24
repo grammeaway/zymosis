@@ -200,7 +200,6 @@ here is an independent TUI reimagining of that concept.
 
 ## Known limitations / roadmap
 
-- Tags can be viewed in the TUI but are only editable via the CLI.
 - The CLI `list` sorts by recency; the TUI additionally floats hot/bubbling to
   the top.
 - Tags are freeform — no typo protection (`perf` and `performance` are distinct).
