@@ -204,3 +204,6 @@ here is an independent TUI reimagining of that concept.
   the top.
 - Tags are freeform — no typo protection (`perf` and `performance` are distinct).
 - Storage is a JSON file. SQLite may come later if a feature needs it.
+
+## AI Usage Disclosure
+This project was developed leveraging agentic coding assistants, to amplify the speed of development. The primary model used was Claude Opus 4.8, through the Pi agentic harness.
