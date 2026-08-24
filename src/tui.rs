@@ -44,6 +44,25 @@ enum Mode {
     EditCfg(CfgField),
 }
 
+/// The three task sections. Dormant and Done are fully separate views, not a
+/// filter over the active list — Tab cycles Active → Dormant → Done.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Active,
+    Dormant,
+    Done,
+}
+
+impl View {
+    fn next(self) -> View {
+        match self {
+            View::Active => View::Dormant,
+            View::Dormant => View::Done,
+            View::Done => View::Active,
+        }
+    }
+}
+
 /// The subset of config editable in the TUI (storage_path stays CLI-only, since
 /// changing it live would mean reloading the store).
 #[derive(Clone, Copy, PartialEq)]
@@ -123,7 +142,7 @@ struct App {
     mode: Mode,
     input: String,
     status: Option<String>,
-    show_dormant: bool,
+    view: View,
     expanded: HashSet<u64>,
     cfg_sel: usize,
     frame: u64,
@@ -141,7 +160,7 @@ impl App {
             mode: Mode::Normal,
             input: String::new(),
             status: None,
-            show_dormant: false,
+            view: View::Active,
             expanded: HashSet::new(),
             cfg_sel: 0,
             frame: 0,
@@ -149,13 +168,21 @@ impl App {
         }
     }
 
-    /// Visible task indices: dormant hidden unless toggled, then ordered by
-    /// lifecycle priority (Hot/Bubbling rise) and recency within a band.
+    /// Task indices belonging to the current view, ordered by lifecycle
+    /// priority (Hot/Bubbling rise) and recency within a band. Done tasks live
+    /// only in the Done view; Active and Dormant split the rest by status.
     fn visible(&self) -> Vec<usize> {
         let now = model::now();
         let th = self.cfg.thresholds();
         let mut idx: Vec<usize> = (0..self.tasks.len())
-            .filter(|&i| self.show_dormant || self.tasks[i].status(&th, now) != Status::Dormant)
+            .filter(|&i| {
+                let t = &self.tasks[i];
+                match self.view {
+                    View::Done => t.done,
+                    View::Dormant => !t.done && t.status(&th, now) == Status::Dormant,
+                    View::Active => !t.done && t.status(&th, now) != Status::Dormant,
+                }
+            })
             .collect();
         idx.sort_by(|&a, &b| {
             let ra = sort_rank(self.tasks[a].status(&th, now));
@@ -256,7 +283,7 @@ impl App {
                 self.selected = move_selection(self.selected, rows, -1)
             }
             KeyCode::Tab => {
-                self.show_dormant = !self.show_dormant;
+                self.view = self.view.next();
                 self.selected = 0;
             }
             KeyCode::Enter | KeyCode::Right => self.toggle_expand(),
@@ -457,9 +484,12 @@ impl App {
         }
     }
 
+    /// Bring a task back to Hot/active: clears `done` (so it leaves the Done
+    /// view) and touches it. This is the path back from Dormant or Done.
     fn revive_selected(&mut self) -> bool {
         match self.selected_task() {
             Some(ti) => {
+                self.tasks[ti].done = false;
                 self.tasks[ti].touch();
                 self.selected = 0;
                 true
@@ -618,10 +648,10 @@ impl App {
             }
 
             let count = self.visible().len();
-            let title = if self.show_dormant {
-                format!(" tasks ({count}) · dormant shown ")
-            } else {
-                format!(" tasks ({count}) ")
+            let title = match self.view {
+                View::Active => format!(" active ({count}) "),
+                View::Dormant => format!(" dormant ({count}) "),
+                View::Done => format!(" done ({count}) "),
             };
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(title))
@@ -652,7 +682,7 @@ impl App {
             Mode::Normal => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
                 None => Line::from(
-                    "a add · s +sub · n +note · e edit · t tags · enter expand · space done · x del · r revive · tab dormant · c config · q"
+                    "a add · s +sub · n +note · e edit · t tags · enter expand · space done · x del · r revive · tab view · c config · q"
                         .dim(),
                 ),
             },
@@ -1138,14 +1168,45 @@ mod tests {
     }
 
     #[test]
-    fn dormant_hidden_until_toggled() {
+    fn views_partition_active_dormant_and_done() {
         let mut app = app_with(0);
-        app.tasks.push(Task::new(1, "fresh"));
-        let mut mid = Task::new(2, "mid");
-        mid.last_updated = model::now() - 16 * 86_400; // dormant band
-        app.tasks.push(mid);
-        let hidden = app.visible().len();
-        app.show_dormant = true;
-        assert!(app.visible().len() > hidden);
+        app.tasks.push(Task::new(1, "fresh")); // active
+        let mut dorm = Task::new(2, "dorm");
+        dorm.last_updated = model::now() - 16 * 86_400; // dormant band
+        app.tasks.push(dorm);
+        let mut done = Task::new(3, "done");
+        done.done = true;
+        app.tasks.push(done);
+
+        app.view = View::Active;
+        assert_eq!(app.visible(), vec![0]);
+        app.view = View::Dormant;
+        assert_eq!(app.visible(), vec![1]);
+        app.view = View::Done;
+        assert_eq!(app.visible(), vec![2]);
+    }
+
+    #[test]
+    fn delete_from_done_view_retires_task() {
+        let mut app = app_with(0);
+        let mut done = Task::new(1, "done");
+        done.done = true;
+        app.tasks.push(done);
+        app.view = View::Done;
+        assert!(app.remove_selected());
+        assert!(app.tasks.is_empty());
+    }
+
+    #[test]
+    fn revive_clears_done_and_returns_to_active() {
+        let mut app = app_with(0);
+        let mut done = Task::new(1, "done");
+        done.done = true;
+        app.tasks.push(done);
+        app.view = View::Done;
+        assert!(app.revive_selected());
+        assert!(!app.tasks[0].done);
+        app.view = View::Active;
+        assert_eq!(app.visible(), vec![0]);
     }
 }
