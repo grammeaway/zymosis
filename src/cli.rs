@@ -85,10 +85,6 @@ fn status_str(s: Status) -> &'static str {
     }
 }
 
-fn next_id(tasks: &[Task]) -> u64 {
-    tasks.iter().map(|t| t.id).max().map_or(1, |m| m + 1)
-}
-
 /// Filtered + sorted (most-recently-updated first) view for `list`.
 fn select<'a>(
     tasks: &'a [Task],
@@ -153,7 +149,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
 
     match cmd {
         Command::Add { title, note, subtasks } => {
-            let mut task = Task::new(next_id(&tasks), title);
+            let mut task = Task::new(Task::next_id(&tasks), title);
             if let Some(n) = note {
                 task.notes = n;
             }
@@ -229,7 +225,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
         }
         Command::Import { path } => {
             let mut incoming = store::import(&path).map_err(io_err)?;
-            let mut id = next_id(&tasks);
+            let mut id = Task::next_id(&tasks);
             for t in &mut incoming {
                 t.id = id;
                 id += 1;
@@ -266,8 +262,8 @@ mod tests {
 
     #[test]
     fn next_id_increments() {
-        assert_eq!(next_id(&[]), 1);
-        assert_eq!(next_id(&[aged(1, 0, false), aged(4, 0, false)]), 5);
+        assert_eq!(Task::next_id(&[]), 1);
+        assert_eq!(Task::next_id(&[aged(1, 0, false), aged(4, 0, false)]), 5);
     }
 
     #[test]

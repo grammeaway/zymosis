@@ -105,6 +105,11 @@ impl Task {
         }
     }
 
+    /// Next free id for a task list (max + 1, or 1 when empty).
+    pub fn next_id(tasks: &[Task]) -> u64 {
+        tasks.iter().map(|t| t.id).max().map_or(1, |m| m + 1)
+    }
+
     /// (completed_subtasks, total_subtasks).
     pub fn progress(&self) -> (usize, usize) {
         let done = self.subtasks.iter().filter(|s| s.done).count();
