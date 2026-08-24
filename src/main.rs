@@ -1,3 +1,7 @@
+// Temporary: model/store/config are exercised by tests and later phases before
+// main() wires them in. Removed in Phase 4 once the CLI uses everything.
+#![allow(dead_code)]
+
 mod cli;
 mod config;
 mod model;
