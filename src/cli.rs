@@ -69,6 +69,8 @@ pub enum Command {
     },
     /// Show a task with its (indexed) subtasks.
     Show { id: u64 },
+    /// Print the version (also available as --version / -V).
+    Version,
     /// Work with a task's subtasks (index is 1-based).
     Subtask {
         #[command(subcommand)]
@@ -215,6 +217,11 @@ fn io_err<E: std::fmt::Display>(e: E) -> String {
 }
 
 pub fn run(cmd: Command) -> Result<(), String> {
+    if let Command::Version = cmd {
+        println!("zym {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let cfg = config::load()?;
 
     // Config command doesn't touch the store.
@@ -438,7 +445,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
             store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
             println!("{msg}");
         }
-        Command::Config { .. } => unreachable!("handled above"),
+        Command::Config { .. } | Command::Version => unreachable!("handled above"),
     }
     Ok(())
 }

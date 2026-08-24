@@ -42,12 +42,37 @@ explicitly reviving it — resets it to **hot**. Marking it *done* does not.
 
 ## Install
 
-Requires a Rust toolchain (stable).
+### Building from source
+
+Requires a Rust toolchain (stable), installable via [rustup](https://rustup.rs/).
+Clone the repository and build:
 
 ```sh
 cargo build --release
 # binary at target/release/zym
 ```
+
+Move that binary to a directory on your `PATH` for easy access.
+
+### Installing from source with Cargo
+
+From the root of the repository:
+
+```sh
+cargo install --path .
+```
+
+### Verifying the installation
+
+Once installed, confirm the binary is on your `PATH` and runnable:
+
+```sh
+zym version
+```
+
+This should print something like `zym 0.1.0` (`zym --version` / `zym -V` work
+too). If you get "command not found" or a stale version, the binary isn't where
+your shell is looking, or an older copy is shadowing the new one.
 
 Data and config live in platform-standard locations (via `dirs`):
 
@@ -129,6 +154,9 @@ zym import tasks-backup.json     # appends; ids are reassigned
 zym config                       # show resolved config + paths
 zym config --init                # write the default config file
 zym config --json
+
+# misc
+zym version                      # print version (also --version / -V)
 ```
 
 Run `zym <command> --help` for details on any subcommand.
