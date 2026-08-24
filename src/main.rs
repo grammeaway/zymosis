@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod model;
 mod store;
+mod tui;
 
 use clap::Parser;
 
@@ -15,9 +16,10 @@ fn main() {
             }
         }
         None => {
-            // Interactive TUI is a later phase.
-            eprintln!("zym: interactive TUI not implemented yet — run `zym --help` for CLI commands");
-            std::process::exit(2);
+            if let Err(e) = tui::run() {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }
