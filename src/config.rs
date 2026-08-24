@@ -21,6 +21,18 @@ use crate::model::Thresholds;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span(pub Duration);
 
+impl Span {
+    /// Parse a human span ("2d", "36h"); the inverse of `as_human`.
+    pub fn parse(s: &str) -> Result<Span, String> {
+        parse_span(s).map(Span)
+    }
+
+    /// Render as the largest exact human unit ("14d" -> "2w").
+    pub fn as_human(&self) -> String {
+        format_span(self.0)
+    }
+}
+
 fn parse_span(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let split = s
@@ -150,8 +162,8 @@ pub fn save(cfg: &Config) -> io::Result<()> {
 }
 
 pub fn save_to(cfg: &Config, path: &Path) -> io::Result<()> {
-    let text =
-        toml::to_string(cfg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let text = toml::to_string(cfg)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             fs::create_dir_all(dir)?;

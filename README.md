@@ -69,9 +69,20 @@ Run `zym` with no arguments to launch the interactive interface.
 | `r` | revive (mark still-relevant → hot) |
 | `x` / `Del` | delete (task, or the highlighted subtask) |
 | `Tab` | show / hide dormant tasks |
+| `c` | open the config screen |
 | `q` / `Esc` | quit |
 
 While typing (add / subtask / edit): `Enter` confirms, `Esc` cancels.
+
+### Config screen (`c`)
+
+Edit the lifecycle thresholds and animation rate without leaving the TUI:
+`↑`/`↓` select a field, `Enter` edits it (values use the same human spans as the
+config file, e.g. `2d`, `36h`), `Enter` again saves, `Esc` backs out. Edits are
+validated (same rules as the file) and written straight to
+`config.toml`; an invalid value shows an error and keeps your input for a retry.
+`storage_path` stays CLI-only, since changing it live would mean reloading the
+store.
 
 ## The CLI
 
@@ -128,6 +139,9 @@ tick_fps      = 12        # TUI animation cap
 ```
 
 `hot_window` must be `<= dormant_after`; the app validates this on load.
+
+Everything here except `storage_path` is also editable in the TUI's config
+screen (press `c`) — see [The TUI](#the-tui).
 
 ## Built with
 

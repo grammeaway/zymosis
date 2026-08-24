@@ -19,7 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, Span as CfgSpan};
 use crate::model::{self, Status, SubTask, Task, Thresholds};
 use crate::store;
 
@@ -38,6 +38,57 @@ enum Mode {
     Add,
     Edit(u64),
     AddSub(u64),
+    Config,
+    EditCfg(CfgField),
+}
+
+/// The subset of config editable in the TUI (storage_path stays CLI-only, since
+/// changing it live would mean reloading the store).
+#[derive(Clone, Copy, PartialEq)]
+enum CfgField {
+    HotWindow,
+    DormantAfter,
+    BubbleAfter,
+    TickFps,
+}
+
+const CFG_FIELDS: [(CfgField, &str); 4] = [
+    (CfgField::HotWindow, "hot_window"),
+    (CfgField::DormantAfter, "dormant_after"),
+    (CfgField::BubbleAfter, "bubble_after"),
+    (CfgField::TickFps, "tick_fps"),
+];
+
+fn cfg_field_index(f: CfgField) -> usize {
+    CFG_FIELDS.iter().position(|(x, _)| *x == f).unwrap()
+}
+
+fn cfg_value(cfg: &Config, f: CfgField) -> String {
+    match f {
+        CfgField::HotWindow => cfg.hot_window.as_human(),
+        CfgField::DormantAfter => cfg.dormant_after.as_human(),
+        CfgField::BubbleAfter => cfg.bubble_after.as_human(),
+        CfgField::TickFps => cfg.tick_fps.to_string(),
+    }
+}
+
+/// Apply one field edit to a copy of the config, parsing + validating. Pure so
+/// the parse/validate branch is testable without a terminal.
+fn apply_cfg(cfg: &Config, f: CfgField, input: &str) -> Result<Config, String> {
+    let mut next = cfg.clone();
+    match f {
+        CfgField::HotWindow => next.hot_window = CfgSpan::parse(input)?,
+        CfgField::DormantAfter => next.dormant_after = CfgSpan::parse(input)?,
+        CfgField::BubbleAfter => next.bubble_after = CfgSpan::parse(input)?,
+        CfgField::TickFps => {
+            next.tick_fps = input
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad number '{}'", input.trim()))?
+        }
+    }
+    next.validate()?;
+    Ok(next)
 }
 
 /// A rendered line: either a task or one of its subtasks (indices into `tasks`).
@@ -56,6 +107,7 @@ struct App {
     status: Option<String>,
     show_dormant: bool,
     expanded: HashSet<u64>,
+    cfg_sel: usize,
     frame: u64,
     quit: bool,
 }
@@ -71,6 +123,7 @@ impl App {
             status: None,
             show_dormant: false,
             expanded: HashSet::new(),
+            cfg_sel: 0,
             frame: 0,
             quit: false,
         }
@@ -130,15 +183,19 @@ impl App {
     fn has_animation(&self) -> bool {
         let now = model::now();
         let th = self.cfg.thresholds();
-        self.visible()
-            .iter()
-            .any(|&i| matches!(self.tasks[i].status(&th, now), Status::Hot | Status::Bubbling))
+        self.visible().iter().any(|&i| {
+            matches!(
+                self.tasks[i].status(&th, now),
+                Status::Hot | Status::Bubbling
+            )
+        })
     }
 
     fn run(&mut self, term: &mut DefaultTerminal) -> Result<(), String> {
-        let tick = Duration::from_millis((1000 / self.cfg.tick_fps.max(1)) as u64);
         let mut dirty = true;
         while !self.quit {
+            // Recomputed each loop so a tick_fps change in the config screen is live.
+            let tick = Duration::from_millis((1000 / self.cfg.tick_fps.max(1)) as u64);
             if dirty {
                 term.draw(|f| self.draw(f)).map_err(|e| e.to_string())?;
                 dirty = false;
@@ -148,6 +205,7 @@ impl App {
                     if k.kind == KeyEventKind::Press {
                         match self.mode {
                             Mode::Normal => self.on_normal_key(k.code),
+                            Mode::Config => self.on_config_key(k.code),
                             _ => self.on_input_key(k.code),
                         }
                         dirty = true;
@@ -168,8 +226,12 @@ impl App {
         let rows = self.rows().len();
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Down | KeyCode::Char('j') => self.selected = move_selection(self.selected, rows, 1),
-            KeyCode::Up | KeyCode::Char('k') => self.selected = move_selection(self.selected, rows, -1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selected = move_selection(self.selected, rows, 1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selected = move_selection(self.selected, rows, -1)
+            }
             KeyCode::Tab => {
                 self.show_dormant = !self.show_dormant;
                 self.selected = 0;
@@ -201,6 +263,10 @@ impl App {
                     self.persist();
                 }
             }
+            KeyCode::Char('c') => {
+                self.cfg_sel = 0;
+                self.mode = Mode::Config;
+            }
             KeyCode::Char('x') | KeyCode::Delete => {
                 if self.remove_selected() {
                     self.persist();
@@ -210,16 +276,55 @@ impl App {
         }
     }
 
+    fn on_config_key(&mut self, code: KeyCode) {
+        self.status = None;
+        match code {
+            KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.cfg_sel = move_selection(self.cfg_sel, CFG_FIELDS.len(), 1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.cfg_sel = move_selection(self.cfg_sel, CFG_FIELDS.len(), -1)
+            }
+            KeyCode::Enter => {
+                let f = CFG_FIELDS[self.cfg_sel].0;
+                self.input = cfg_value(&self.cfg, f);
+                self.mode = Mode::EditCfg(f);
+            }
+            _ => {}
+        }
+    }
+
     fn on_input_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => {
-                self.mode = Mode::Normal;
+                self.mode = if matches!(self.mode, Mode::EditCfg(_)) {
+                    Mode::Config
+                } else {
+                    Mode::Normal
+                };
                 self.input.clear();
             }
             KeyCode::Backspace => {
                 self.input.pop();
             }
             KeyCode::Char(c) => self.input.push(c),
+            // Config edits parse/validate and stay on the config screen; a bad
+            // value shows an error and keeps the input for a retry.
+            KeyCode::Enter if matches!(self.mode, Mode::EditCfg(_)) => {
+                let Mode::EditCfg(f) = self.mode else {
+                    unreachable!()
+                };
+                match apply_cfg(&self.cfg, f, &self.input) {
+                    Ok(next) => {
+                        self.cfg = next;
+                        self.save_cfg();
+                        self.mode = Mode::Config;
+                        self.input.clear();
+                    }
+                    Err(e) => self.status = Some(e),
+                }
+            }
             KeyCode::Enter => {
                 let title = self.input.trim().to_string();
                 if !title.is_empty() {
@@ -227,7 +332,7 @@ impl App {
                         Mode::Add => self.add_task(title),
                         Mode::Edit(id) => self.apply_edit(id, title),
                         Mode::AddSub(id) => self.add_subtask(id, title),
-                        Mode::Normal => {}
+                        Mode::Normal | Mode::Config | Mode::EditCfg(_) => {}
                     }
                     self.persist();
                 }
@@ -241,7 +346,8 @@ impl App {
     // --- pure mutations (no I/O; caller persists) ---
 
     fn add_task(&mut self, title: String) {
-        self.tasks.push(Task::new(Task::next_id(&self.tasks), title));
+        self.tasks
+            .push(Task::new(Task::next_id(&self.tasks), title));
         self.selected = 0;
     }
 
@@ -322,6 +428,12 @@ impl App {
         }
     }
 
+    fn save_cfg(&mut self) {
+        if let Err(e) = config::save(&self.cfg) {
+            self.status = Some(format!("config save failed: {e}"));
+        }
+    }
+
     fn draw(&self, f: &mut Frame) {
         let now = model::now();
         let th = self.cfg.thresholds();
@@ -337,75 +449,124 @@ impl App {
             header,
         );
 
-        let rows = self.rows();
-        let items: Vec<ListItem> = rows
-            .iter()
-            .map(|row| match *row {
-                Row::Task(ti) => {
-                    let t = &self.tasks[ti];
-                    let (mark, mut style) = row_style(t.status(&th, now), t.age(now), &th, self.frame);
-                    let (done, total) = t.progress();
-                    let expand = if total > 0 {
-                        let caret = if self.expanded.contains(&t.id) { "▾" } else { "▸" };
-                        format!(" {caret} [{done}/{total}]")
-                    } else {
-                        String::new()
-                    };
-                    let mark = if t.done { "✓" } else { mark };
-                    if t.done {
-                        style = style.add_modifier(Modifier::CROSSED_OUT | Modifier::DIM);
-                    }
-                    let mut spans =
-                        vec![Span::styled(format!("{mark} {}{expand}", t.title), style)];
-                    if !t.tags.is_empty() {
-                        let chips =
-                            t.tags.iter().map(|x| format!("#{x}")).collect::<Vec<_>>().join(" ");
-                        spans.push(Span::styled(format!("  {chips}"), Style::default().fg(TAG)));
-                    }
-                    ListItem::new(Line::from(spans))
-                }
-                Row::Sub(ti, si) => {
-                    let s = &self.tasks[ti].subtasks[si];
-                    let mark = if s.done { "✓" } else { "·" };
-                    let mut style = Style::default().fg(SUBTASK);
-                    if s.done {
-                        style = style.add_modifier(Modifier::CROSSED_OUT | Modifier::DIM);
-                    }
-                    ListItem::new(Line::styled(format!("    ↳ {mark} {}", s.title), style))
-                }
-            })
-            .collect();
-
-        let mut state = ListState::default();
-        if !rows.is_empty() {
-            state.select(Some(self.selected.min(rows.len() - 1)));
-        }
-
-        let count = self.visible().len();
-        let title = if self.show_dormant {
-            format!(" tasks ({count}) · dormant shown ")
+        if matches!(self.mode, Mode::Config | Mode::EditCfg(_)) {
+            self.draw_config(f, body);
         } else {
-            format!(" tasks ({count}) ")
-        };
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .highlight_symbol("▶ ")
-            .highlight_style(Style::default().fg(NEON_ACCENT).add_modifier(Modifier::REVERSED));
-        f.render_stateful_widget(list, body, &mut state);
+            let rows = self.rows();
+            let items: Vec<ListItem> = rows
+                .iter()
+                .map(|row| match *row {
+                    Row::Task(ti) => {
+                        let t = &self.tasks[ti];
+                        let (mark, mut style) =
+                            row_style(t.status(&th, now), t.age(now), &th, self.frame);
+                        let (done, total) = t.progress();
+                        let expand = if total > 0 {
+                            let caret = if self.expanded.contains(&t.id) {
+                                "▾"
+                            } else {
+                                "▸"
+                            };
+                            format!(" {caret} [{done}/{total}]")
+                        } else {
+                            String::new()
+                        };
+                        let mark = if t.done { "✓" } else { mark };
+                        if t.done {
+                            style = style.add_modifier(Modifier::CROSSED_OUT | Modifier::DIM);
+                        }
+                        let mut spans =
+                            vec![Span::styled(format!("{mark} {}{expand}", t.title), style)];
+                        if !t.tags.is_empty() {
+                            let chips = t
+                                .tags
+                                .iter()
+                                .map(|x| format!("#{x}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            spans
+                                .push(Span::styled(format!("  {chips}"), Style::default().fg(TAG)));
+                        }
+                        ListItem::new(Line::from(spans))
+                    }
+                    Row::Sub(ti, si) => {
+                        let s = &self.tasks[ti].subtasks[si];
+                        let mark = if s.done { "✓" } else { "·" };
+                        let mut style = Style::default().fg(SUBTASK);
+                        if s.done {
+                            style = style.add_modifier(Modifier::CROSSED_OUT | Modifier::DIM);
+                        }
+                        ListItem::new(Line::styled(format!("    ↳ {mark} {}", s.title), style))
+                    }
+                })
+                .collect();
+
+            let mut state = ListState::default();
+            if !rows.is_empty() {
+                state.select(Some(self.selected.min(rows.len() - 1)));
+            }
+
+            let count = self.visible().len();
+            let title = if self.show_dormant {
+                format!(" tasks ({count}) · dormant shown ")
+            } else {
+                format!(" tasks ({count}) ")
+            };
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .highlight_symbol("▶ ")
+                .highlight_style(
+                    Style::default()
+                        .fg(NEON_ACCENT)
+                        .add_modifier(Modifier::REVERSED),
+                );
+            f.render_stateful_widget(list, body, &mut state);
+        }
 
         let footer_line = match self.mode {
             Mode::Add => Line::from(format!("add> {}", self.input).fg(NEON_HOT)),
             Mode::AddSub(_) => Line::from(format!("subtask> {}", self.input).fg(NEON_HOT)),
             Mode::Edit(_) => Line::from(format!("edit> {}", self.input).fg(NEON_HOT)),
+            Mode::EditCfg(f) => match &self.status {
+                Some(msg) => Line::from(msg.clone().fg(Color::Red)),
+                None => Line::from(format!("{}> {}", CFG_FIELDS[cfg_field_index(f)].1, self.input).fg(NEON_HOT)),
+            },
+            Mode::Config => match &self.status {
+                Some(msg) => Line::from(msg.clone().fg(Color::Red)),
+                None => Line::from("↑↓ select · enter edit · esc back".dim()),
+            },
             Mode::Normal => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
                 None => Line::from(
-                    "a add · s +sub · e edit · enter expand · space done · x del · r revive · tab dormant · q"
+                    "a add · s +sub · e edit · enter expand · space done · x del · r revive · tab dormant · c config · q"
                         .dim(),
                 ),
             },
         };
         f.render_widget(Paragraph::new(footer_line), footer);
+    }
+
+    fn draw_config(&self, f: &mut Frame, body: ratatui::layout::Rect) {
+        let items: Vec<ListItem> = CFG_FIELDS
+            .iter()
+            .map(|(field, label)| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{label:14}"), Style::default().fg(TAG)),
+                    Span::raw(cfg_value(&self.cfg, *field)),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.cfg_sel.min(CFG_FIELDS.len() - 1)));
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(" config "))
+            .highlight_symbol("▶ ")
+            .highlight_style(
+                Style::default()
+                    .fg(NEON_ACCENT)
+                    .add_modifier(Modifier::REVERSED),
+            );
+        f.render_stateful_widget(list, body, &mut state);
     }
 }
 
@@ -486,13 +647,23 @@ fn decay_color(age: Duration, th: &Thresholds) -> Color {
 
 fn row_style(st: Status, age: Duration, th: &Thresholds, frame: u64) -> (&'static str, Style) {
     match st {
-        Status::Hot => ("·", Style::default().fg(breathe(NEON_HOT, frame)).add_modifier(Modifier::BOLD)),
+        Status::Hot => (
+            "·",
+            Style::default()
+                .fg(breathe(NEON_HOT, frame))
+                .add_modifier(Modifier::BOLD),
+        ),
         Status::Bubbling => (
             bubble_glyph(frame),
-            Style::default().fg(breathe(NEON_BUBBLE, frame)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(breathe(NEON_BUBBLE, frame))
+                .add_modifier(Modifier::BOLD),
         ),
         Status::Decaying => ("·", Style::default().fg(decay_color(age, th))),
-        Status::Dormant => ("·", Style::default().fg(DORMANT).add_modifier(Modifier::DIM)),
+        Status::Dormant => (
+            "·",
+            Style::default().fg(DORMANT).add_modifier(Modifier::DIM),
+        ),
     }
 }
 
@@ -502,7 +673,9 @@ mod tests {
     use crate::model::SubTask;
 
     fn app_with(n: usize) -> App {
-        let tasks = (0..n).map(|i| Task::new(i as u64 + 1, format!("t{i}"))).collect();
+        let tasks = (0..n)
+            .map(|i| Task::new(i as u64 + 1, format!("t{i}")))
+            .collect();
         App::new(Config::default(), tasks)
     }
 
@@ -554,8 +727,14 @@ mod tests {
     fn expand_reveals_subtask_rows_and_toggles_them() {
         let mut app = app_with(1);
         app.tasks[0].subtasks = vec![
-            SubTask { title: "a".into(), done: false },
-            SubTask { title: "b".into(), done: false },
+            SubTask {
+                title: "a".into(),
+                done: false,
+            },
+            SubTask {
+                title: "b".into(),
+                done: false,
+            },
         ];
         assert_eq!(app.rows().len(), 1); // collapsed: just the task
         app.selected = 0;
@@ -583,8 +762,14 @@ mod tests {
     fn remove_on_subtask_row_deletes_only_the_subtask() {
         let mut app = app_with(1);
         app.tasks[0].subtasks = vec![
-            SubTask { title: "a".into(), done: false },
-            SubTask { title: "b".into(), done: false },
+            SubTask {
+                title: "a".into(),
+                done: false,
+            },
+            SubTask {
+                title: "b".into(),
+                done: false,
+            },
         ];
         app.toggle_expand(); // selected is task row 0
         app.selected = 1; // first subtask row
@@ -624,6 +809,25 @@ mod tests {
             let (br, bg, bb) = to_rgb(NEON_HOT);
             assert!(r <= br && g <= bg && b <= bb);
         }
+    }
+
+    #[test]
+    fn apply_cfg_parses_validates_and_rejects() {
+        let cfg = Config::default();
+        // valid span edit round-trips through the human format
+        let next = apply_cfg(&cfg, CfgField::HotWindow, "1d").unwrap();
+        assert_eq!(next.hot_window.as_human(), "1d");
+        // tick_fps parses as a number
+        assert_eq!(
+            apply_cfg(&cfg, CfgField::TickFps, "30").unwrap().tick_fps,
+            30
+        );
+        // garbage span and number are rejected
+        assert!(apply_cfg(&cfg, CfgField::HotWindow, "nope").is_err());
+        assert!(apply_cfg(&cfg, CfgField::TickFps, "x").is_err());
+        // tick_fps must be >= 1, and hot_window must stay <= dormant_after
+        assert!(apply_cfg(&cfg, CfgField::TickFps, "0").is_err());
+        assert!(apply_cfg(&cfg, CfgField::HotWindow, "999d").is_err());
     }
 
     #[test]

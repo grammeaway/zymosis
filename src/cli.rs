@@ -117,7 +117,14 @@ fn tag_suffix(t: &Task) -> String {
     if t.tags.is_empty() {
         String::new()
     } else {
-        format!("  {}", t.tags.iter().map(|x| format!("#{x}")).collect::<Vec<_>>().join(" "))
+        format!(
+            "  {}",
+            t.tags
+                .iter()
+                .map(|x| format!("#{x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
     }
 }
 
@@ -207,7 +214,12 @@ pub fn run(cmd: Command) -> Result<(), String> {
     let now = model::now();
 
     match cmd {
-        Command::Add { title, note, subtasks, tags } => {
+        Command::Add {
+            title,
+            note,
+            subtasks,
+            tags,
+        } => {
             let mut task = Task::new(Task::next_id(&tasks), title);
             if let Some(n) = note {
                 task.notes = n;
@@ -224,12 +236,20 @@ pub fn run(cmd: Command) -> Result<(), String> {
             store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
             println!("added task {id}");
         }
-        Command::List { status, tag, all, json } => {
+        Command::List {
+            status,
+            tag,
+            all,
+            json,
+        } => {
             let view = select(&tasks, &cfg, status, tag.as_deref(), all, now);
             if json {
                 let out: Vec<TaskView> = view
                     .iter()
-                    .map(|t| TaskView { task: t, status: status_str(status_of(t, &cfg, now)) })
+                    .map(|t| TaskView {
+                        task: t,
+                        status: status_str(status_of(t, &cfg, now)),
+                    })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&out).map_err(io_err)?);
             } else if view.is_empty() {
@@ -237,7 +257,11 @@ pub fn run(cmd: Command) -> Result<(), String> {
             } else {
                 for t in view {
                     let (done, total) = t.progress();
-                    let prog = if total > 0 { format!(" [{done}/{total}]") } else { String::new() };
+                    let prog = if total > 0 {
+                        format!(" [{done}/{total}]")
+                    } else {
+                        String::new()
+                    };
                     let mark = if t.done { "x" } else { " " };
                     let tags = tag_suffix(t);
                     println!(
@@ -399,8 +423,14 @@ mod tests {
     fn sub_index_is_one_based_and_bounded() {
         let mut t = Task::new(1, "x");
         t.subtasks = vec![
-            model::SubTask { title: "a".into(), done: false },
-            model::SubTask { title: "b".into(), done: false },
+            model::SubTask {
+                title: "a".into(),
+                done: false,
+            },
+            model::SubTask {
+                title: "b".into(),
+                done: false,
+            },
         ];
         assert_eq!(sub_index(&t, 1, 1).unwrap(), 0);
         assert_eq!(sub_index(&t, 2, 1).unwrap(), 1);
@@ -420,12 +450,14 @@ mod tests {
         let now = NOW;
         let day = 86_400;
         let tasks = vec![
-            aged(1, 0, false),         // hot
-            aged(2, 0, true),          // hot but done
-            aged(3, 20 * day, false),  // dormant
+            aged(1, 0, false),        // hot
+            aged(2, 0, true),         // hot but done
+            aged(3, 20 * day, false), // dormant
         ];
-        let ids: Vec<u64> =
-            select(&tasks, &cfg, None, None, false, now).iter().map(|t| t.id).collect();
+        let ids: Vec<u64> = select(&tasks, &cfg, None, None, false, now)
+            .iter()
+            .map(|t| t.id)
+            .collect();
         assert_eq!(ids, vec![1]);
 
         // --all shows everything
@@ -460,8 +492,10 @@ mod tests {
         let cfg = Config::default();
         let now = NOW;
         let tasks = vec![aged(1, 500, false), aged(2, 10, false), aged(3, 100, false)];
-        let ids: Vec<u64> =
-            select(&tasks, &cfg, None, None, true, now).iter().map(|t| t.id).collect();
+        let ids: Vec<u64> = select(&tasks, &cfg, None, None, true, now)
+            .iter()
+            .map(|t| t.id)
+            .collect();
         assert_eq!(ids, vec![2, 3, 1]);
     }
 }

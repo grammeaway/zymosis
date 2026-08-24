@@ -102,7 +102,9 @@ impl Task {
 
     /// Remove a tag. Returns whether one was removed.
     pub fn remove_tag(&mut self, tag: &str) -> bool {
-        let Some(t) = normalize_tag(tag) else { return false };
+        let Some(t) = normalize_tag(tag) else {
+            return false;
+        };
         let before = self.tags.len();
         self.tags.retain(|x| x != &t);
         self.tags.len() != before

@@ -35,7 +35,10 @@ fn write_atomic(path: &Path, tasks: &[Task]) -> io::Result<()> {
     // Temp file in the SAME directory so the rename stays on one filesystem
     // (rename is only atomic within a filesystem). Pid-tagged to avoid two
     // concurrent invocations clobbering each other's temp.
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("tasks.json");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("tasks.json");
     let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
 
     let write = || -> io::Result<()> {
