@@ -62,6 +62,23 @@ pub enum Command {
         #[arg(long)]
         init: bool,
     },
+    /// Show a task with its (indexed) subtasks.
+    Show { id: u64 },
+    /// Work with a task's subtasks (index is 1-based).
+    Subtask {
+        #[command(subcommand)]
+        action: SubtaskCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SubtaskCmd {
+    /// Append a subtask.
+    Add { task_id: u64, title: String },
+    /// Toggle a subtask done.
+    Done { task_id: u64, index: usize },
+    /// Remove a subtask.
+    Rm { task_id: u64, index: usize },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -119,6 +136,14 @@ fn find_mut<'a>(tasks: &'a mut [Task], id: u64) -> Result<&'a mut Task, String> 
         .iter_mut()
         .find(|t| t.id == id)
         .ok_or_else(|| format!("no task with id {id}"))
+}
+
+/// Resolve a 1-based subtask index to a 0-based slot, or a clear error.
+fn sub_index(t: &Task, index: usize, task_id: u64) -> Result<usize, String> {
+    index
+        .checked_sub(1)
+        .filter(|&i| i < t.subtasks.len())
+        .ok_or_else(|| format!("no subtask {index} on task {task_id}"))
 }
 
 fn io_err<E: std::fmt::Display>(e: E) -> String {
@@ -235,6 +260,52 @@ pub fn run(cmd: Command) -> Result<(), String> {
             store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
             println!("imported {n} task(s)");
         }
+        Command::Show { id } => {
+            let t = tasks
+                .iter()
+                .find(|t| t.id == id)
+                .ok_or_else(|| format!("no task with id {id}"))?;
+            let mark = if t.done { "x" } else { " " };
+            println!("#{} [{}] {}", t.id, mark, t.title);
+            println!("status: {}", status_str(status_of(t, &cfg, now)));
+            if !t.notes.is_empty() {
+                println!("notes:  {}", t.notes);
+            }
+            if t.subtasks.is_empty() {
+                println!("(no subtasks)");
+            } else {
+                for (i, s) in t.subtasks.iter().enumerate() {
+                    let m = if s.done { "x" } else { " " };
+                    println!("  {:>2}. [{}] {}", i + 1, m, s.title);
+                }
+            }
+        }
+        Command::Subtask { action } => {
+            let msg = match action {
+                SubtaskCmd::Add { task_id, title } => {
+                    let t = find_mut(&mut tasks, task_id)?;
+                    t.subtasks.push(model::SubTask { title, done: false });
+                    t.touch();
+                    format!("added subtask to task {task_id}")
+                }
+                SubtaskCmd::Done { task_id, index } => {
+                    let t = find_mut(&mut tasks, task_id)?;
+                    let i = sub_index(t, index, task_id)?;
+                    t.subtasks[i].done = !t.subtasks[i].done;
+                    t.touch();
+                    format!("toggled subtask {index} on task {task_id}")
+                }
+                SubtaskCmd::Rm { task_id, index } => {
+                    let t = find_mut(&mut tasks, task_id)?;
+                    let i = sub_index(t, index, task_id)?;
+                    t.subtasks.remove(i);
+                    t.touch();
+                    format!("removed subtask {index} from task {task_id}")
+                }
+            };
+            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            println!("{msg}");
+        }
         Command::Config { .. } => unreachable!("handled above"),
     }
     Ok(())
@@ -258,6 +329,19 @@ mod tests {
         t.done = done;
         t.last_updated = NOW - secs_ago;
         t
+    }
+
+    #[test]
+    fn sub_index_is_one_based_and_bounded() {
+        let mut t = Task::new(1, "x");
+        t.subtasks = vec![
+            model::SubTask { title: "a".into(), done: false },
+            model::SubTask { title: "b".into(), done: false },
+        ];
+        assert_eq!(sub_index(&t, 1, 1).unwrap(), 0);
+        assert_eq!(sub_index(&t, 2, 1).unwrap(), 1);
+        assert!(sub_index(&t, 0, 1).is_err()); // 0 is not valid (1-based)
+        assert!(sub_index(&t, 3, 1).is_err()); // out of range
     }
 
     #[test]

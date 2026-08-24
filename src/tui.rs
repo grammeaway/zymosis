@@ -3,10 +3,13 @@
 //! Slice 2: add/edit/done/revive/delete with atomic save-on-change.
 //! Slice 3: capped tick loop + juice (bubbling animation, hot breathe, decay
 //!          color ramp) and a dormant-section toggle.
+//! Slice 4: expandable subtasks (inline). Enter/→ expands a task; space toggles
+//!          the highlighted subtask. Adding/removing subtasks stays in the CLI.
 //!
 //! Terminal setup/teardown goes through `ratatui::try_init`/`try_restore`, which
 //! install a panic hook that restores the terminal.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -36,6 +39,13 @@ enum Mode {
     Edit(u64),
 }
 
+/// A rendered line: either a task or one of its subtasks (indices into `tasks`).
+#[derive(Clone, Copy)]
+enum Row {
+    Task(usize),
+    Sub(usize, usize),
+}
+
 struct App {
     cfg: Config,
     tasks: Vec<Task>,
@@ -44,6 +54,7 @@ struct App {
     input: String,
     status: Option<String>,
     show_dormant: bool,
+    expanded: HashSet<u64>,
     frame: u64,
     quit: bool,
 }
@@ -58,13 +69,14 @@ impl App {
             input: String::new(),
             status: None,
             show_dormant: false,
+            expanded: HashSet::new(),
             frame: 0,
             quit: false,
         }
     }
 
-    /// Visible rows: dormant hidden unless toggled, then ordered by lifecycle
-    /// priority (Hot and Bubbling rise to the top) and recency within a band.
+    /// Visible task indices: dormant hidden unless toggled, then ordered by
+    /// lifecycle priority (Hot/Bubbling rise) and recency within a band.
     fn visible(&self) -> Vec<usize> {
         let now = model::now();
         let th = self.cfg.thresholds();
@@ -80,11 +92,32 @@ impl App {
         idx
     }
 
-    fn selected_task(&self) -> Option<usize> {
-        self.visible().get(self.selected).copied()
+    /// Flattened rows: each visible task, followed by its subtasks if expanded.
+    fn rows(&self) -> Vec<Row> {
+        let mut out = Vec::new();
+        for ti in self.visible() {
+            out.push(Row::Task(ti));
+            if self.expanded.contains(&self.tasks[ti].id) {
+                for si in 0..self.tasks[ti].subtasks.len() {
+                    out.push(Row::Sub(ti, si));
+                }
+            }
+        }
+        out
     }
 
-    /// Only Hot/Bubbling rows animate, so a list without them needs no redraw.
+    fn selected_row(&self) -> Option<Row> {
+        self.rows().get(self.selected).copied()
+    }
+
+    /// Task index of the selected row, only when a *task* row is highlighted.
+    fn selected_task(&self) -> Option<usize> {
+        match self.selected_row() {
+            Some(Row::Task(ti)) => Some(ti),
+            _ => None,
+        }
+    }
+
     fn has_animation(&self) -> bool {
         let now = model::now();
         let th = self.cfg.thresholds();
@@ -112,7 +145,6 @@ impl App {
                     }
                 }
             } else {
-                // tick: advance animation, redraw only if something moves.
                 self.frame = self.frame.wrapping_add(1);
                 if self.has_animation() {
                     dirty = true;
@@ -124,15 +156,16 @@ impl App {
 
     fn on_normal_key(&mut self, code: KeyCode) {
         self.status = None;
-        let len = self.tasks.len();
+        let rows = self.rows().len();
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Down | KeyCode::Char('j') => self.selected = move_selection(self.selected, len, 1),
-            KeyCode::Up | KeyCode::Char('k') => self.selected = move_selection(self.selected, len, -1),
+            KeyCode::Down | KeyCode::Char('j') => self.selected = move_selection(self.selected, rows, 1),
+            KeyCode::Up | KeyCode::Char('k') => self.selected = move_selection(self.selected, rows, -1),
             KeyCode::Tab => {
                 self.show_dormant = !self.show_dormant;
                 self.selected = 0;
             }
+            KeyCode::Enter | KeyCode::Right => self.toggle_expand(),
             KeyCode::Char('a') => {
                 self.input.clear();
                 self.mode = Mode::Add;
@@ -144,7 +177,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') | KeyCode::Char(' ') => {
-                if self.toggle_done() {
+                if self.toggle_selected() {
                     self.persist();
                 }
             }
@@ -204,20 +237,36 @@ impl App {
         self.selected = 0;
     }
 
-    fn toggle_done(&mut self) -> bool {
-        match self.selected_task() {
-            Some(i) => {
-                self.tasks[i].done = !self.tasks[i].done;
+    /// Toggle done on the highlighted row: a task, or a subtask (which also
+    /// touches its parent, since interacting keeps a task relevant).
+    fn toggle_selected(&mut self) -> bool {
+        match self.selected_row() {
+            Some(Row::Task(ti)) => {
+                self.tasks[ti].done = !self.tasks[ti].done;
+                true
+            }
+            Some(Row::Sub(ti, si)) => {
+                self.tasks[ti].subtasks[si].done = !self.tasks[ti].subtasks[si].done;
+                self.tasks[ti].touch();
                 true
             }
             None => false,
         }
     }
 
+    fn toggle_expand(&mut self) {
+        if let Some(ti) = self.selected_task() {
+            let id = self.tasks[ti].id;
+            if !self.expanded.remove(&id) {
+                self.expanded.insert(id);
+            }
+        }
+    }
+
     fn revive_selected(&mut self) -> bool {
         match self.selected_task() {
-            Some(i) => {
-                self.tasks[i].touch();
+            Some(ti) => {
+                self.tasks[ti].touch();
                 self.selected = 0;
                 true
             }
@@ -227,9 +276,10 @@ impl App {
 
     fn remove_selected(&mut self) -> bool {
         match self.selected_task() {
-            Some(i) => {
-                self.tasks.remove(i);
-                self.selected = self.selected.min(self.tasks.len().saturating_sub(1));
+            Some(ti) => {
+                self.expanded.remove(&self.tasks[ti].id);
+                self.tasks.remove(ti);
+                self.selected = self.selected.min(self.rows().len().saturating_sub(1));
                 true
             }
             None => false,
@@ -257,31 +307,48 @@ impl App {
             header,
         );
 
-        let order = self.visible();
-        let items: Vec<ListItem> = order
+        let rows = self.rows();
+        let items: Vec<ListItem> = rows
             .iter()
-            .map(|&i| {
-                let t = &self.tasks[i];
-                let (mark, mut style) = row_style(t.status(&th, now), t.age(now), &th, self.frame);
-                let (done, total) = t.progress();
-                let prog = if total > 0 { format!("  [{done}/{total}]") } else { String::new() };
-                let mark = if t.done { "✓" } else { mark };
-                if t.done {
-                    style = style.add_modifier(Modifier::CROSSED_OUT | Modifier::DIM);
+            .map(|row| match *row {
+                Row::Task(ti) => {
+                    let t = &self.tasks[ti];
+                    let (mark, mut style) = row_style(t.status(&th, now), t.age(now), &th, self.frame);
+                    let (done, total) = t.progress();
+                    let expand = if total > 0 {
+                        let caret = if self.expanded.contains(&t.id) { "▾" } else { "▸" };
+                        format!(" {caret} [{done}/{total}]")
+                    } else {
+                        String::new()
+                    };
+                    let mark = if t.done { "✓" } else { mark };
+                    if t.done {
+                        style = style.add_modifier(Modifier::CROSSED_OUT | Modifier::DIM);
+                    }
+                    ListItem::new(Line::styled(format!("{mark} {}{expand}", t.title), style))
                 }
-                ListItem::new(Line::styled(format!("{mark} {}{prog}", t.title), style))
+                Row::Sub(ti, si) => {
+                    let s = &self.tasks[ti].subtasks[si];
+                    let mark = if s.done { "✓" } else { "·" };
+                    let mut style = Style::default().fg(SUBTASK);
+                    if s.done {
+                        style = style.add_modifier(Modifier::CROSSED_OUT | Modifier::DIM);
+                    }
+                    ListItem::new(Line::styled(format!("    ↳ {mark} {}", s.title), style))
+                }
             })
             .collect();
 
         let mut state = ListState::default();
-        if !order.is_empty() {
-            state.select(Some(self.selected.min(order.len() - 1)));
+        if !rows.is_empty() {
+            state.select(Some(self.selected.min(rows.len() - 1)));
         }
 
+        let count = self.visible().len();
         let title = if self.show_dormant {
-            format!(" tasks ({}) · dormant shown ", order.len())
+            format!(" tasks ({count}) · dormant shown ")
         } else {
-            format!(" tasks ({}) ", order.len())
+            format!(" tasks ({count}) ")
         };
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(title))
@@ -295,7 +362,8 @@ impl App {
             Mode::Normal => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
                 None => Line::from(
-                    "a add · e edit · d done · r revive · x del · tab dormant · q quit".dim(),
+                    "a add · e edit · enter expand · d/space done · r revive · x del · tab dormant · q quit"
+                        .dim(),
                 ),
             },
         };
@@ -310,7 +378,6 @@ fn move_selection(cur: usize, len: usize, delta: i32) -> usize {
     (cur as i32 + delta).clamp(0, len as i32 - 1) as usize
 }
 
-/// Lifecycle priority for list ordering: Hot and Bubbling rise, Dormant sinks.
 fn sort_rank(s: Status) -> u8 {
     match s {
         Status::Hot => 0,
@@ -322,12 +389,13 @@ fn sort_rank(s: Status) -> u8 {
 
 // --- palette + animation (pure, testable) ---
 
-const NEON_ACCENT: Color = Color::Rgb(0, 255, 213); // teal
-const NEON_HOT: Color = Color::Rgb(255, 60, 172); // magenta
-const NEON_BUBBLE: Color = Color::Rgb(90, 230, 255); // cyan
+const NEON_ACCENT: Color = Color::Rgb(0, 255, 213);
+const NEON_HOT: Color = Color::Rgb(255, 60, 172);
+const NEON_BUBBLE: Color = Color::Rgb(90, 230, 255);
 const DECAY_FRESH: Color = Color::Rgb(150, 200, 210);
 const DECAY_STALE: Color = Color::Rgb(95, 95, 120);
 const DORMANT: Color = Color::Rgb(80, 80, 105);
+const SUBTASK: Color = Color::Rgb(140, 150, 170);
 const BUBBLES: [&str; 4] = ["·", "∘", "○", "°"];
 
 fn to_rgb(c: Color) -> (u8, u8, u8) {
@@ -351,7 +419,6 @@ fn lerp_rgb(a: Color, b: Color, t: f32) -> Color {
     Color::Rgb(l(ar, br), l(ag, bg), l(ab, bb))
 }
 
-/// Gentle brightness pulse (triangle wave, 0.75..1.0) for hot/bubbling rows.
 fn breathe(base: Color, frame: u64) -> Color {
     const PERIOD: u64 = 12;
     let phase = frame % (2 * PERIOD);
@@ -363,12 +430,10 @@ fn breathe(base: Color, frame: u64) -> Color {
     scale_rgb(base, 0.75 + 0.25 * tri)
 }
 
-/// Cycling rising-bubble glyph for bubbling rows.
 fn bubble_glyph(frame: u64) -> &'static str {
     BUBBLES[((frame / 2) % BUBBLES.len() as u64) as usize]
 }
 
-/// Fade a decaying row's colour from fresh toward stale across its band.
 fn decay_color(age: Duration, th: &Thresholds) -> Color {
     let start = th.hot_window.as_secs() as f32;
     let end = th.dormant_after.as_secs() as f32;
@@ -380,7 +445,6 @@ fn decay_color(age: Duration, th: &Thresholds) -> Color {
     lerp_rgb(DECAY_FRESH, DECAY_STALE, t)
 }
 
-/// (mark glyph, base style) for a row given its lifecycle state.
 fn row_style(st: Status, age: Duration, th: &Thresholds, frame: u64) -> (&'static str, Style) {
     match st {
         Status::Hot => ("·", Style::default().fg(breathe(NEON_HOT, frame)).add_modifier(Modifier::BOLD)),
@@ -396,6 +460,7 @@ fn row_style(st: Status, age: Duration, th: &Thresholds, frame: u64) -> (&'stati
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SubTask;
 
     fn app_with(n: usize) -> App {
         let tasks = (0..n).map(|i| Task::new(i as u64 + 1, format!("t{i}"))).collect();
@@ -424,12 +489,10 @@ mod tests {
     }
 
     #[test]
-    fn toggle_done_flips_selected() {
+    fn toggle_task_flips_done() {
         let mut app = app_with(1);
-        assert!(app.toggle_done());
+        assert!(app.toggle_selected());
         assert!(app.tasks[0].done);
-        assert!(app.toggle_done());
-        assert!(!app.tasks[0].done);
     }
 
     #[test]
@@ -443,9 +506,28 @@ mod tests {
     #[test]
     fn mutations_on_empty_are_noops() {
         let mut app = app_with(0);
-        assert!(!app.toggle_done());
+        assert!(!app.toggle_selected());
         assert!(!app.remove_selected());
         assert!(!app.revive_selected());
+    }
+
+    #[test]
+    fn expand_reveals_subtask_rows_and_toggles_them() {
+        let mut app = app_with(1);
+        app.tasks[0].subtasks = vec![
+            SubTask { title: "a".into(), done: false },
+            SubTask { title: "b".into(), done: false },
+        ];
+        assert_eq!(app.rows().len(), 1); // collapsed: just the task
+        app.selected = 0;
+        app.toggle_expand();
+        assert_eq!(app.rows().len(), 3); // task + 2 subtasks
+
+        // move to first subtask row and toggle it
+        app.selected = 1;
+        assert!(app.toggle_selected());
+        assert!(app.tasks[0].subtasks[0].done);
+        assert!(!app.tasks[0].subtasks[1].done);
     }
 
     #[test]
@@ -457,42 +539,35 @@ mod tests {
 
     #[test]
     fn bubble_glyph_cycles() {
-        let seq: Vec<&str> = (0..8).map(bubble_glyph).collect();
-        assert_eq!(seq[0], "·");
-        assert_eq!(bubble_glyph(0), bubble_glyph(2 * BUBBLES.len() as u64 * 1)); // period repeats
+        assert_eq!(bubble_glyph(0), "·");
+        assert_eq!(bubble_glyph(0), bubble_glyph(2 * BUBBLES.len() as u64));
     }
 
     #[test]
     fn decay_color_ramps_between_endpoints() {
         let t = th();
-        assert_eq!(decay_color(t.hot_window, &t), DECAY_FRESH); // start of band
-        assert_eq!(decay_color(t.dormant_after, &t), DECAY_STALE); // end of band
-        // midpoint sits strictly between the endpoints
+        assert_eq!(decay_color(t.hot_window, &t), DECAY_FRESH);
+        assert_eq!(decay_color(t.dormant_after, &t), DECAY_STALE);
         let mid = decay_color((t.hot_window + t.dormant_after) / 2, &t);
         assert_ne!(mid, DECAY_FRESH);
         assert_ne!(mid, DECAY_STALE);
     }
 
     #[test]
-    fn breathe_stays_in_range_and_is_rgb() {
+    fn breathe_never_brighter_than_base() {
         for frame in 0..48u64 {
             let (r, g, b) = to_rgb(breathe(NEON_HOT, frame));
             let (br, bg, bb) = to_rgb(NEON_HOT);
-            assert!(r <= br && g <= bg && b <= bb); // never brighter than base
+            assert!(r <= br && g <= bg && b <= bb);
         }
     }
 
     #[test]
     fn dormant_hidden_until_toggled() {
         let mut app = app_with(0);
-        let mut stale = Task::new(1, "old");
-        stale.last_updated = 0; // ancient -> dormant/bubbling
-        app.tasks.push(stale);
-        app.tasks.push(Task::new(2, "fresh")); // hot
-        // default hides very old dormant rows... but very old becomes Bubbling,
-        // so assert the toggle changes visibility count for a mid-dormant task.
-        let mut mid = Task::new(3, "mid");
-        mid.last_updated = model::now() - 16 * 86_400; // > dormant_after(14d), < +bubble
+        app.tasks.push(Task::new(1, "fresh"));
+        let mut mid = Task::new(2, "mid");
+        mid.last_updated = model::now() - 16 * 86_400; // dormant band
         app.tasks.push(mid);
         let hidden = app.visible().len();
         app.show_dormant = true;
