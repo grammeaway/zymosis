@@ -1,0 +1,152 @@
+# zymosis (`zym`)
+
+A terminal todo list where tasks "ferment". Instead of rotting in a flat,
+ever-growing bog of a `TODO.md`, tasks move through a lifecycle: *hot* when you're
+working on them, *decaying* as they go untouched, *dormant* when they drop off
+your radar, and *bubbling* back up later so good-but-not-now ideas resurface
+instead of being lost.
+
+Heavily inspired by 37signals' [Fizzy](https://www.fizzy.do/). The idea of
+letting ideas settle and bubble back up is theirs; this is a small, self-hosted
+TUI/CLI take on it.
+
+## The lifecycle
+
+Every task has a *last updated* time. Its state is **derived** from how long it's
+been since you touched it, against thresholds you configure:
+
+| State | When | In the UI |
+|-------|------|-----------|
+| **hot** | recently updated | bright, "breathing", floats to the top |
+| **decaying** | left alone a while | colour fades the longer it's ignored |
+| **dormant** | ignored long enough | hidden from the main list |
+| **bubbling** | dormant even longer | rises back to the top with an animated bubble, so you rediscover it |
+
+Interacting with a task — editing it, ticking a subtask, adding a tag, or
+explicitly reviving it — resets it to **hot**. Marking it *done* does not.
+
+## Features
+
+- Add / edit / complete / delete tasks.
+- **Subtasks** with a completed/total summary on the parent.
+- **Tags / categories** (freeform, e.g. `monitoring`, `perf`, `org`) with tag filtering.
+- Time-based **hot / decaying / dormant / bubbling** lifecycle, fully configurable.
+- **Revive** dormant tasks, or let bubbling surface them for you.
+- **Export / import** to JSON for sharing or backup.
+- A **CLI** mirroring every operation, so scripts and agentic tools can drive it.
+- A **TUI** with lo-fi juice: a neon palette, a decay colour ramp, gently
+  pulsing hot tasks, and animated rising bubbles.
+
+## Install
+
+Requires a Rust toolchain (stable).
+
+```sh
+cargo build --release
+# binary at target/release/zym
+```
+
+Data and config live in platform-standard locations (via `dirs`):
+
+- Config: `~/.config/zym/config.toml`
+- Tasks:  `~/.local/share/zym/tasks.json`
+
+Saves are atomic (write-temp-then-rename), so a crash mid-write can't corrupt
+your list.
+
+## The TUI
+
+Run `zym` with no arguments to launch the interactive interface.
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / `↑` / `↓` | move selection |
+| `a` | add a task |
+| `s` | add a subtask to the current task |
+| `e` | edit the selected task's title |
+| `Enter` / `→` | expand / collapse subtasks |
+| `Space` / `d` | toggle done (task or highlighted subtask) |
+| `r` | revive (mark still-relevant → hot) |
+| `x` / `Del` | delete (task, or the highlighted subtask) |
+| `Tab` | show / hide dormant tasks |
+| `q` / `Esc` | quit |
+
+While typing (add / subtask / edit): `Enter` confirms, `Esc` cancels.
+
+## The CLI
+
+Every subcommand loads, mutates, and atomically saves the store. `list --json`
+and per-task detail are handy for scripting and agentic tools.
+
+```sh
+# tasks
+zym add "write the report" --note "Q3" --subtask "draft" --tag org
+zym list                         # active tasks (hides done + dormant)
+zym list --all                   # everything
+zym list --status decaying       # filter by lifecycle band
+zym list --tag org               # filter by tag
+zym list --json                  # machine-readable, includes derived status
+zym show 1                       # task detail with indexed subtasks + tags
+zym done 1                       # mark complete
+zym edit 1 --title "..." --note "..."
+zym revive 1                     # still-relevant → hot
+zym rm 1
+
+# subtasks (index is 1-based, as shown by `zym show`)
+zym subtask add 1 "review with team"
+zym subtask done 1 2
+zym subtask rm 1 2
+
+# tags / categories (freeform, normalised to lowercase)
+zym tag add 1 monitoring
+zym tag rm 1 monitoring
+
+# data
+zym export tasks-backup.json
+zym import tasks-backup.json     # appends; ids are reassigned
+
+# config
+zym config                       # show resolved config + paths
+zym config --init                # write the default config file
+zym config --json
+```
+
+Run `zym <command> --help` for details on any subcommand.
+
+## Configuration
+
+`~/.config/zym/config.toml` — any missing field falls back to its default, so
+you only write what you want to change. Durations are human-readable spans
+(`s`/`m`/`h`/`d`/`w`).
+
+```toml
+hot_window    = "2d"     # newer than this → hot
+dormant_after = "2w"     # older than this → dormant (hidden)
+bubble_after  = "30d"    # dormant this much longer → bubbling
+storage_path  = "/home/you/.local/share/zym/tasks.json"
+tick_fps      = 12        # TUI animation cap
+```
+
+`hot_window` must be `<= dormant_after`; the app validates this on load.
+
+## Built with
+
+- [Ratatui](https://ratatui.rs/) — terminal UI
+- [Serde](https://serde.rs/) + [serde_json](https://github.com/serde-rs/json) — serialization / storage
+- [clap](https://github.com/clap-rs/clap) — CLI parsing
+- [toml](https://github.com/toml-rs/toml) — config
+- [dirs](https://github.com/dirs-dev/directories-rs) — platform paths
+- [proptest](https://github.com/proptest-rs/proptest) — property-based tests
+
+## Credits
+
+The core idea of a task tracker which mirrors how tasks' life-cycle actually tends to be, is inspired by **37signals' Fizzy**. Everything
+here is an independent TUI reimagining of that concept.
+
+## Known limitations / roadmap
+
+- Tags can be viewed in the TUI but are only editable via the CLI.
+- The CLI `list` sorts by recency; the TUI additionally floats hot/bubbling to
+  the top.
+- Tags are freeform — no typo protection (`perf` and `performance` are distinct).
+- Storage is a JSON file. SQLite may come later if a feature needs it.
