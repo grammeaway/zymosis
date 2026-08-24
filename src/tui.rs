@@ -722,7 +722,14 @@ struct Theme {
     banner_bottom: Color,
 }
 
-const THEME_NAMES: [&str; 2] = ["neon_purple", "neon_teal"];
+const THEME_NAMES: [&str; 6] = [
+    "neon_purple",
+    "neon_teal",
+    "catppuccin_mocha",
+    "catppuccin_macchiato",
+    "catppuccin_frappe",
+    "catppuccin_latte",
+];
 
 /// Default: loud purple-forward neon-punk.
 const NEON_PURPLE: Theme = Theme {
@@ -754,11 +761,76 @@ const NEON_TEAL: Theme = Theme {
     banner_bottom: Color::Rgb(90, 230, 255),
 };
 
+/// Catppuccin Mocha (the flagship dark flavor). Field mapping: mauve accent,
+/// red for hot, blue for bubbling, green notes, lavender tags.
+const CATPPUCCIN_MOCHA: Theme = Theme {
+    accent: Color::Rgb(203, 166, 247),
+    hot: Color::Rgb(243, 139, 168),
+    bubble: Color::Rgb(137, 180, 250),
+    decay_fresh: Color::Rgb(205, 214, 244),
+    decay_stale: Color::Rgb(108, 112, 134),
+    dormant: Color::Rgb(88, 91, 112),
+    subtask: Color::Rgb(166, 173, 200),
+    note: Color::Rgb(166, 227, 161),
+    tag: Color::Rgb(180, 190, 254),
+    banner_top: Color::Rgb(245, 194, 231),
+    banner_bottom: Color::Rgb(203, 166, 247),
+};
+
+/// Catppuccin Macchiato.
+const CATPPUCCIN_MACCHIATO: Theme = Theme {
+    accent: Color::Rgb(198, 160, 246),
+    hot: Color::Rgb(237, 135, 150),
+    bubble: Color::Rgb(138, 173, 244),
+    decay_fresh: Color::Rgb(202, 211, 245),
+    decay_stale: Color::Rgb(110, 115, 141),
+    dormant: Color::Rgb(91, 96, 120),
+    subtask: Color::Rgb(165, 173, 203),
+    note: Color::Rgb(166, 218, 149),
+    tag: Color::Rgb(183, 189, 248),
+    banner_top: Color::Rgb(245, 189, 230),
+    banner_bottom: Color::Rgb(198, 160, 246),
+};
+
+/// Catppuccin Frappé.
+const CATPPUCCIN_FRAPPE: Theme = Theme {
+    accent: Color::Rgb(202, 158, 230),
+    hot: Color::Rgb(231, 130, 132),
+    bubble: Color::Rgb(140, 170, 238),
+    decay_fresh: Color::Rgb(198, 208, 245),
+    decay_stale: Color::Rgb(115, 121, 148),
+    dormant: Color::Rgb(98, 104, 128),
+    subtask: Color::Rgb(165, 173, 206),
+    note: Color::Rgb(166, 209, 137),
+    tag: Color::Rgb(186, 187, 241),
+    banner_top: Color::Rgb(244, 184, 228),
+    banner_bottom: Color::Rgb(202, 158, 230),
+};
+
+/// Catppuccin Latte (the light flavor). Darker foregrounds since the base is light.
+const CATPPUCCIN_LATTE: Theme = Theme {
+    accent: Color::Rgb(136, 57, 239),
+    hot: Color::Rgb(210, 15, 57),
+    bubble: Color::Rgb(30, 102, 245),
+    decay_fresh: Color::Rgb(76, 79, 105),
+    decay_stale: Color::Rgb(156, 160, 176),
+    dormant: Color::Rgb(188, 192, 204),
+    subtask: Color::Rgb(92, 95, 119),
+    note: Color::Rgb(64, 160, 43),
+    tag: Color::Rgb(114, 135, 253),
+    banner_top: Color::Rgb(234, 118, 203),
+    banner_bottom: Color::Rgb(136, 57, 239),
+};
+
 impl Theme {
     /// Resolve a config theme name; unknown names fall back to the default.
     fn named(name: &str) -> Theme {
         match name {
             "neon_teal" => NEON_TEAL,
+            "catppuccin_mocha" => CATPPUCCIN_MOCHA,
+            "catppuccin_macchiato" => CATPPUCCIN_MACCHIATO,
+            "catppuccin_frappe" => CATPPUCCIN_FRAPPE,
+            "catppuccin_latte" => CATPPUCCIN_LATTE,
             _ => NEON_PURPLE,
         }
     }
