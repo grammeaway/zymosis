@@ -10,6 +10,8 @@ Heavily inspired by 37signals' [Fizzy](https://www.fizzy.do/). The idea of
 letting ideas settle and bubble back up is theirs; this is a small, self-hosted
 TUI/CLI take on it.
 
+![TUI preview](./docs/preview.png)
+
 ## The lifecycle
 
 Every task has a *last updated* time. Its state is **derived** from how long it's
