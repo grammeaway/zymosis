@@ -36,8 +36,9 @@ explicitly reviving it — resets it to **hot**. Marking it *done* does not.
 - **Revive** dormant tasks, or let bubbling surface them for you.
 - **Export / import** to JSON for sharing or backup.
 - A **CLI** mirroring every operation, so scripts and agentic tools can drive it.
-- A **TUI** with lo-fi juice: a neon palette, a decay colour ramp, gently
-  pulsing hot tasks, and animated rising bubbles.
+- A **TUI** with lo-fi juice: a neon-punk block-letter banner, a purple-forward
+  palette (swappable via `theme`), a decay colour ramp, gently pulsing hot
+  tasks, and animated rising bubbles.
 
 ## Install
 
@@ -144,9 +145,11 @@ dormant_after = "2w"     # older than this → dormant (hidden)
 bubble_after  = "30d"    # dormant this much longer → bubbling
 storage_path  = "/home/you/.local/share/zym/tasks.json"
 tick_fps      = 12        # TUI animation cap
+theme         = "neon_purple"  # color theme; also: "neon_teal"
 ```
 
-`hot_window` must be `<= dormant_after`; the app validates this on load.
+`hot_window` must be `<= dormant_after`; the app validates this on load. An
+unknown `theme` name falls back to the default, so the file always loads.
 
 Everything here except `storage_path` is also editable in the TUI's config
 screen (press `c`) — see [The TUI](#the-tui).

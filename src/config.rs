@@ -87,6 +87,10 @@ pub struct Config {
     pub storage_path: PathBuf,
     /// TUI redraw cap (frames/sec).
     pub tick_fps: u32,
+    /// Named color theme (resolved by the TUI; unknown names fall back to the
+    /// default). Kept a free string so old files load and new themes need no
+    /// schema change.
+    pub theme: String,
 }
 
 impl Default for Config {
@@ -97,6 +101,7 @@ impl Default for Config {
             bubble_after: Span(Duration::from_secs(30 * 86_400)),
             storage_path: default_storage_path(),
             tick_fps: 12,
+            theme: "neon_purple".into(),
         }
     }
 }

@@ -52,13 +52,15 @@ enum CfgField {
     DormantAfter,
     BubbleAfter,
     TickFps,
+    Theme,
 }
 
-const CFG_FIELDS: [(CfgField, &str); 4] = [
+const CFG_FIELDS: [(CfgField, &str); 5] = [
     (CfgField::HotWindow, "hot_window"),
     (CfgField::DormantAfter, "dormant_after"),
     (CfgField::BubbleAfter, "bubble_after"),
     (CfgField::TickFps, "tick_fps"),
+    (CfgField::Theme, "theme"),
 ];
 
 fn cfg_field_index(f: CfgField) -> usize {
@@ -71,6 +73,7 @@ fn cfg_value(cfg: &Config, f: CfgField) -> String {
         CfgField::DormantAfter => cfg.dormant_after.as_human(),
         CfgField::BubbleAfter => cfg.bubble_after.as_human(),
         CfgField::TickFps => cfg.tick_fps.to_string(),
+        CfgField::Theme => cfg.theme.clone(),
     }
 }
 
@@ -88,6 +91,16 @@ fn apply_cfg(cfg: &Config, f: CfgField, input: &str) -> Result<Config, String> {
                 .parse()
                 .map_err(|_| format!("bad number '{}'", input.trim()))?
         }
+        CfgField::Theme => {
+            let name = input.trim();
+            if !THEME_NAMES.contains(&name) {
+                return Err(format!(
+                    "unknown theme '{name}' (try: {})",
+                    THEME_NAMES.join(", ")
+                ));
+            }
+            next.theme = name.to_string();
+        }
     }
     next.validate()?;
     Ok(next)
@@ -104,6 +117,7 @@ enum Row {
 
 struct App {
     cfg: Config,
+    theme: Theme,
     tasks: Vec<Task>,
     selected: usize,
     mode: Mode,
@@ -118,8 +132,10 @@ struct App {
 
 impl App {
     fn new(cfg: Config, tasks: Vec<Task>) -> Self {
+        let theme = Theme::named(&cfg.theme);
         Self {
             cfg,
+            theme,
             tasks,
             selected: 0,
             mode: Mode::Normal,
@@ -337,6 +353,7 @@ impl App {
                 match apply_cfg(&self.cfg, f, &self.input) {
                     Ok(next) => {
                         self.cfg = next;
+                        self.theme = Theme::named(&self.cfg.theme); // live theme switch
                         self.save_cfg();
                         self.mode = Mode::Config;
                         self.input.clear();
@@ -485,20 +502,43 @@ impl App {
         }
     }
 
+    /// The neon block-letter title, gradient top→bottom, with a subtitle line.
+    fn banner(&self) -> Vec<Line<'static>> {
+        let last = (BANNER.len() - 1).max(1) as f32;
+        let mut lines: Vec<Line> = BANNER
+            .iter()
+            .enumerate()
+            .map(|(i, art)| {
+                let c = lerp_rgb(
+                    self.theme.banner_top,
+                    self.theme.banner_bottom,
+                    i as f32 / last,
+                );
+                Line::from(Span::styled(
+                    *art,
+                    Style::default().fg(c).add_modifier(Modifier::BOLD),
+                ))
+            })
+            .collect();
+        lines.push(Line::from(
+            "« zymosis — fermenting todo »"
+                .fg(self.theme.accent)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        lines
+    }
+
     fn draw(&self, f: &mut Frame) {
         let now = model::now();
         let th = self.cfg.thresholds();
         let [header, body, footer] = Layout::vertical([
-            Constraint::Length(1),
+            Constraint::Length(BANNER.len() as u16 + 1),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
         .areas(f.area());
 
-        f.render_widget(
-            Paragraph::new(Line::from("zym — fermenting todo".fg(NEON_ACCENT).bold())),
-            header,
-        );
+        f.render_widget(Paragraph::new(self.banner()), header);
 
         if matches!(self.mode, Mode::Config | Mode::EditCfg(_)) {
             self.draw_config(f, body);
@@ -510,7 +550,7 @@ impl App {
                     Row::Task(ti) => {
                         let t = &self.tasks[ti];
                         let (mark, mut style) =
-                            row_style(t.status(&th, now), t.age(now), &th, self.frame);
+                            row_style(&self.theme, t.status(&th, now), t.age(now), &th, self.frame);
                         let (done, total) = t.progress();
                         let notes = t.notes.len();
                         let expand = if total > 0 || notes > 0 {
@@ -546,15 +586,17 @@ impl App {
                                 .map(|x| format!("#{x}"))
                                 .collect::<Vec<_>>()
                                 .join(" ");
-                            spans
-                                .push(Span::styled(format!("  {chips}"), Style::default().fg(TAG)));
+                            spans.push(Span::styled(
+                                format!("  {chips}"),
+                                Style::default().fg(self.theme.tag),
+                            ));
                         }
                         ListItem::new(Line::from(spans))
                     }
                     Row::Sub(ti, si) => {
                         let s = &self.tasks[ti].subtasks[si];
                         let mark = if s.done { "✓" } else { "·" };
-                        let mut style = Style::default().fg(SUBTASK);
+                        let mut style = Style::default().fg(self.theme.subtask);
                         if s.done {
                             style = style.add_modifier(Modifier::CROSSED_OUT | Modifier::DIM);
                         }
@@ -562,7 +604,9 @@ impl App {
                     }
                     Row::Note(ti, ni) => {
                         let n = &self.tasks[ti].notes[ni];
-                        let style = Style::default().fg(NOTE).add_modifier(Modifier::ITALIC);
+                        let style = Style::default()
+                            .fg(self.theme.note)
+                            .add_modifier(Modifier::ITALIC);
                         ListItem::new(Line::styled(format!("    ✎ {}", n.text), style))
                     }
                 })
@@ -584,21 +628,22 @@ impl App {
                 .highlight_symbol("▶ ")
                 .highlight_style(
                     Style::default()
-                        .fg(NEON_ACCENT)
+                        .fg(self.theme.accent)
                         .add_modifier(Modifier::REVERSED),
                 );
             f.render_stateful_widget(list, body, &mut state);
         }
 
+        let hot = self.theme.hot;
         let footer_line = match self.mode {
-            Mode::Add => Line::from(format!("add> {}", self.input).fg(NEON_HOT)),
-            Mode::AddSub(_) => Line::from(format!("subtask> {}", self.input).fg(NEON_HOT)),
-            Mode::AddNote(_) => Line::from(format!("note> {}", self.input).fg(NEON_HOT)),
-            Mode::Edit(_) => Line::from(format!("edit> {}", self.input).fg(NEON_HOT)),
-            Mode::EditTags(_) => Line::from(format!("tags> {}", self.input).fg(NEON_HOT)),
+            Mode::Add => Line::from(format!("add> {}", self.input).fg(hot)),
+            Mode::AddSub(_) => Line::from(format!("subtask> {}", self.input).fg(hot)),
+            Mode::AddNote(_) => Line::from(format!("note> {}", self.input).fg(hot)),
+            Mode::Edit(_) => Line::from(format!("edit> {}", self.input).fg(hot)),
+            Mode::EditTags(_) => Line::from(format!("tags> {}", self.input).fg(hot)),
             Mode::EditCfg(f) => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
-                None => Line::from(format!("{}> {}", CFG_FIELDS[cfg_field_index(f)].1, self.input).fg(NEON_HOT)),
+                None => Line::from(format!("{}> {}", CFG_FIELDS[cfg_field_index(f)].1, self.input).fg(hot)),
             },
             Mode::Config => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
@@ -620,7 +665,7 @@ impl App {
             .iter()
             .map(|(field, label)| {
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{label:14}"), Style::default().fg(TAG)),
+                    Span::styled(format!("{label:14}"), Style::default().fg(self.theme.tag)),
                     Span::raw(cfg_value(&self.cfg, *field)),
                 ]))
             })
@@ -632,7 +677,7 @@ impl App {
             .highlight_symbol("▶ ")
             .highlight_style(
                 Style::default()
-                    .fg(NEON_ACCENT)
+                    .fg(self.theme.accent)
                     .add_modifier(Modifier::REVERSED),
             );
         f.render_stateful_widget(list, body, &mut state);
@@ -657,16 +702,78 @@ fn sort_rank(s: Status) -> u8 {
 
 // --- palette + animation (pure, testable) ---
 
-const NEON_ACCENT: Color = Color::Rgb(0, 255, 213);
-const NEON_HOT: Color = Color::Rgb(255, 60, 172);
-const NEON_BUBBLE: Color = Color::Rgb(90, 230, 255);
-const DECAY_FRESH: Color = Color::Rgb(150, 200, 210);
-const DECAY_STALE: Color = Color::Rgb(95, 95, 120);
-const DORMANT: Color = Color::Rgb(80, 80, 105);
-const SUBTASK: Color = Color::Rgb(140, 150, 170);
-const NOTE: Color = Color::Rgb(150, 170, 140);
-const TAG: Color = Color::Rgb(180, 140, 255);
+/// All theme-able colors in one place. Rendering reads only from a `Theme`, so a
+/// new palette is a new `const Theme` + a name in `Theme::named` — the groundwork
+/// for user-configurable themes.
+// ponytail: built-in named themes only; add per-field RGB overrides in the TOML
+// (a `[theme]` table merged over the named base) if anyone wants custom colors.
+#[derive(Clone, Copy)]
+struct Theme {
+    accent: Color,
+    hot: Color,
+    bubble: Color,
+    decay_fresh: Color,
+    decay_stale: Color,
+    dormant: Color,
+    subtask: Color,
+    note: Color,
+    tag: Color,
+    banner_top: Color,
+    banner_bottom: Color,
+}
+
+const THEME_NAMES: [&str; 2] = ["neon_purple", "neon_teal"];
+
+/// Default: loud purple-forward neon-punk.
+const NEON_PURPLE: Theme = Theme {
+    accent: Color::Rgb(187, 92, 255),
+    hot: Color::Rgb(255, 45, 149),
+    bubble: Color::Rgb(150, 120, 255),
+    decay_fresh: Color::Rgb(200, 170, 235),
+    decay_stale: Color::Rgb(110, 95, 135),
+    dormant: Color::Rgb(90, 80, 110),
+    subtask: Color::Rgb(160, 150, 190),
+    note: Color::Rgb(150, 190, 150),
+    tag: Color::Rgb(200, 140, 255),
+    banner_top: Color::Rgb(255, 60, 200),
+    banner_bottom: Color::Rgb(120, 90, 255),
+};
+
+/// The original teal palette, kept selectable to prove themes are swappable.
+const NEON_TEAL: Theme = Theme {
+    accent: Color::Rgb(0, 255, 213),
+    hot: Color::Rgb(255, 60, 172),
+    bubble: Color::Rgb(90, 230, 255),
+    decay_fresh: Color::Rgb(150, 200, 210),
+    decay_stale: Color::Rgb(95, 95, 120),
+    dormant: Color::Rgb(80, 80, 105),
+    subtask: Color::Rgb(140, 150, 170),
+    note: Color::Rgb(150, 170, 140),
+    tag: Color::Rgb(180, 140, 255),
+    banner_top: Color::Rgb(0, 255, 213),
+    banner_bottom: Color::Rgb(90, 230, 255),
+};
+
+impl Theme {
+    /// Resolve a config theme name; unknown names fall back to the default.
+    fn named(name: &str) -> Theme {
+        match name {
+            "neon_teal" => NEON_TEAL,
+            _ => NEON_PURPLE,
+        }
+    }
+}
+
 const BUBBLES: [&str; 4] = ["·", "∘", "○", "°"];
+
+/// Block-letter "ZYM" banner; each row gets a top→bottom gradient at draw time.
+const BANNER: [&str; 5] = [
+    "███████  ██   ██  ███    ███",
+    "    ███   ██ ██   ████  ████",
+    "   ███     ███    ██ ████ ██",
+    "  ███      ██     ██  ██  ██",
+    "███████    ██     ██      ██",
+];
 
 fn to_rgb(c: Color) -> (u8, u8, u8) {
     match c {
@@ -704,7 +811,7 @@ fn bubble_glyph(frame: u64) -> &'static str {
     BUBBLES[((frame / 2) % BUBBLES.len() as u64) as usize]
 }
 
-fn decay_color(age: Duration, th: &Thresholds) -> Color {
+fn decay_color(theme: &Theme, age: Duration, th: &Thresholds) -> Color {
     let start = th.hot_window.as_secs() as f32;
     let end = th.dormant_after.as_secs() as f32;
     let t = if end > start {
@@ -712,27 +819,35 @@ fn decay_color(age: Duration, th: &Thresholds) -> Color {
     } else {
         0.0
     };
-    lerp_rgb(DECAY_FRESH, DECAY_STALE, t)
+    lerp_rgb(theme.decay_fresh, theme.decay_stale, t)
 }
 
-fn row_style(st: Status, age: Duration, th: &Thresholds, frame: u64) -> (&'static str, Style) {
+fn row_style(
+    theme: &Theme,
+    st: Status,
+    age: Duration,
+    th: &Thresholds,
+    frame: u64,
+) -> (&'static str, Style) {
     match st {
         Status::Hot => (
             "·",
             Style::default()
-                .fg(breathe(NEON_HOT, frame))
+                .fg(breathe(theme.hot, frame))
                 .add_modifier(Modifier::BOLD),
         ),
         Status::Bubbling => (
             bubble_glyph(frame),
             Style::default()
-                .fg(breathe(NEON_BUBBLE, frame))
+                .fg(breathe(theme.bubble, frame))
                 .add_modifier(Modifier::BOLD),
         ),
-        Status::Decaying => ("·", Style::default().fg(decay_color(age, th))),
+        Status::Decaying => ("·", Style::default().fg(decay_color(theme, age, th))),
         Status::Dormant => (
             "·",
-            Style::default().fg(DORMANT).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(theme.dormant)
+                .add_modifier(Modifier::DIM),
         ),
     }
 }
@@ -894,20 +1009,41 @@ mod tests {
     #[test]
     fn decay_color_ramps_between_endpoints() {
         let t = th();
-        assert_eq!(decay_color(t.hot_window, &t), DECAY_FRESH);
-        assert_eq!(decay_color(t.dormant_after, &t), DECAY_STALE);
-        let mid = decay_color((t.hot_window + t.dormant_after) / 2, &t);
-        assert_ne!(mid, DECAY_FRESH);
-        assert_ne!(mid, DECAY_STALE);
+        let tm = NEON_PURPLE;
+        assert_eq!(decay_color(&tm, t.hot_window, &t), tm.decay_fresh);
+        assert_eq!(decay_color(&tm, t.dormant_after, &t), tm.decay_stale);
+        let mid = decay_color(&tm, (t.hot_window + t.dormant_after) / 2, &t);
+        assert_ne!(mid, tm.decay_fresh);
+        assert_ne!(mid, tm.decay_stale);
     }
 
     #[test]
     fn breathe_never_brighter_than_base() {
         for frame in 0..48u64 {
-            let (r, g, b) = to_rgb(breathe(NEON_HOT, frame));
-            let (br, bg, bb) = to_rgb(NEON_HOT);
+            let (r, g, b) = to_rgb(breathe(NEON_PURPLE.hot, frame));
+            let (br, bg, bb) = to_rgb(NEON_PURPLE.hot);
             assert!(r <= br && g <= bg && b <= bb);
         }
+    }
+
+    #[test]
+    fn theme_named_falls_back_to_default_on_unknown() {
+        let default = Theme::named("neon_purple");
+        assert_eq!(to_rgb(Theme::named("bogus").accent), to_rgb(default.accent));
+        assert_ne!(
+            to_rgb(Theme::named("neon_teal").accent),
+            to_rgb(default.accent)
+        );
+    }
+
+    #[test]
+    fn apply_cfg_theme_validates_name_and_switches() {
+        let cfg = Config::default();
+        assert_eq!(
+            apply_cfg(&cfg, CfgField::Theme, "neon_teal").unwrap().theme,
+            "neon_teal"
+        );
+        assert!(apply_cfg(&cfg, CfgField::Theme, "nope").is_err());
     }
 
     #[test]
