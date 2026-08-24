@@ -64,6 +64,7 @@ Run `zym` with no arguments to launch the interactive interface.
 | `a` | add a task |
 | `s` | add a subtask to the current task |
 | `e` | edit the selected task's title |
+| `t` | edit the selected task's tags (space-separated; empty clears all) |
 | `Enter` / `→` | expand / collapse subtasks |
 | `Space` / `d` | toggle done (task or highlighted subtask) |
 | `r` | revive (mark still-relevant → hot) |

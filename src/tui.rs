@@ -38,6 +38,7 @@ enum Mode {
     Add,
     Edit(u64),
     AddSub(u64),
+    EditTags(u64),
     Config,
     EditCfg(CfgField),
 }
@@ -253,6 +254,12 @@ impl App {
                     self.mode = Mode::Edit(self.tasks[i].id);
                 }
             }
+            KeyCode::Char('t') => {
+                if let Some(i) = self.selected_task() {
+                    self.input = self.tasks[i].tags.join(" ");
+                    self.mode = Mode::EditTags(self.tasks[i].id);
+                }
+            }
             KeyCode::Char('d') | KeyCode::Char(' ') => {
                 if self.toggle_selected() {
                     self.persist();
@@ -327,12 +334,17 @@ impl App {
             }
             KeyCode::Enter => {
                 let title = self.input.trim().to_string();
-                if !title.is_empty() {
+                // EditTags applies even when empty (empty input clears all tags);
+                // the other input modes treat empty as a no-op.
+                if let Mode::EditTags(id) = self.mode {
+                    self.apply_tags(id, title);
+                    self.persist();
+                } else if !title.is_empty() {
                     match self.mode {
                         Mode::Add => self.add_task(title),
                         Mode::Edit(id) => self.apply_edit(id, title),
                         Mode::AddSub(id) => self.add_subtask(id, title),
-                        Mode::Normal | Mode::Config | Mode::EditCfg(_) => {}
+                        Mode::Normal | Mode::Config | Mode::EditCfg(_) | Mode::EditTags(_) => {}
                     }
                     self.persist();
                 }
@@ -354,6 +366,20 @@ impl App {
     fn apply_edit(&mut self, id: u64, title: String) {
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
             t.title = title;
+            t.touch();
+        }
+        self.selected = 0;
+    }
+
+    /// Re-set a task's whole tag set from a space-separated input, reusing
+    /// `add_tag` for normalization + dedup. A leading `#` (as shown in chips)
+    /// is tolerated. Editing tags touches the task, like every interaction.
+    fn apply_tags(&mut self, id: u64, input: String) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+            t.tags.clear();
+            for tok in input.split_whitespace() {
+                t.add_tag(tok.trim_start_matches('#'));
+            }
             t.touch();
         }
         self.selected = 0;
@@ -527,6 +553,7 @@ impl App {
             Mode::Add => Line::from(format!("add> {}", self.input).fg(NEON_HOT)),
             Mode::AddSub(_) => Line::from(format!("subtask> {}", self.input).fg(NEON_HOT)),
             Mode::Edit(_) => Line::from(format!("edit> {}", self.input).fg(NEON_HOT)),
+            Mode::EditTags(_) => Line::from(format!("tags> {}", self.input).fg(NEON_HOT)),
             Mode::EditCfg(f) => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
                 None => Line::from(format!("{}> {}", CFG_FIELDS[cfg_field_index(f)].1, self.input).fg(NEON_HOT)),
@@ -538,7 +565,7 @@ impl App {
             Mode::Normal => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
                 None => Line::from(
-                    "a add · s +sub · e edit · enter expand · space done · x del · r revive · tab dormant · c config · q"
+                    "a add · s +sub · e edit · t tags · enter expand · space done · x del · r revive · tab dormant · c config · q"
                         .dim(),
                 ),
             },
@@ -777,6 +804,16 @@ mod tests {
         assert_eq!(app.tasks.len(), 1); // task survives
         assert_eq!(app.tasks[0].subtasks.len(), 1);
         assert_eq!(app.tasks[0].subtasks[0].title, "b");
+    }
+
+    #[test]
+    fn edit_tags_sets_normalizes_dedups_and_clears() {
+        let mut app = app_with(1);
+        let id = app.tasks[0].id;
+        app.apply_tags(id, "  Perf  #Monitoring perf ".into());
+        assert_eq!(app.tasks[0].tags, vec!["perf", "monitoring"]); // trimmed, lowercased, deduped, # stripped
+        app.apply_tags(id, String::new());
+        assert!(app.tasks[0].tags.is_empty()); // empty input clears
     }
 
     #[test]
