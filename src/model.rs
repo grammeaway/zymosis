@@ -51,12 +51,21 @@ pub struct SubTask {
     pub done: bool,
 }
 
+/// A freeform note on a task: additional detail/consideration, timestamped so
+/// the history is visible when a bubbling task resurfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    pub text: String,
+    pub created: Timestamp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: u64,
     pub title: String,
+    /// Timestamped details/considerations, appended over time.
     #[serde(default)]
-    pub notes: String,
+    pub notes: Vec<Note>,
     pub created: Timestamp,
     pub last_updated: Timestamp,
     #[serde(default)]
@@ -80,7 +89,7 @@ impl Task {
         Self {
             id,
             title: title.into(),
-            notes: String::new(),
+            notes: Vec::new(),
             created: ts,
             last_updated: ts,
             done: false,
@@ -98,6 +107,21 @@ impl Task {
             }
             _ => false,
         }
+    }
+
+    /// Append a note (trimmed + timestamped). Returns whether one was added
+    /// (empty/whitespace text is ignored). Does not touch; the caller does, so
+    /// note-taking follows the same "interaction resets to Hot" rule as tags.
+    pub fn add_note(&mut self, text: &str) -> bool {
+        let t = text.trim();
+        if t.is_empty() {
+            return false;
+        }
+        self.notes.push(Note {
+            text: t.to_string(),
+            created: now(),
+        });
+        true
     }
 
     /// Remove a tag. Returns whether one was removed.
@@ -188,6 +212,15 @@ mod tests {
         assert!(t.has_tag("MONITORING"));
         assert!(t.remove_tag("monitoring"));
         assert!(t.tags.is_empty());
+    }
+
+    #[test]
+    fn notes_append_and_ignore_empty() {
+        let mut t = Task::new(1, "x");
+        assert!(t.add_note("  consider caching  "));
+        assert!(!t.add_note("   ")); // whitespace-only ignored
+        assert_eq!(t.notes.len(), 1);
+        assert_eq!(t.notes[0].text, "consider caching"); // trimmed
     }
 
     proptest! {

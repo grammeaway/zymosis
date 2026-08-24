@@ -29,6 +29,8 @@ explicitly reviving it — resets it to **hot**. Marking it *done* does not.
 
 - Add / edit / complete / delete tasks.
 - **Subtasks** with a completed/total summary on the parent.
+- **Notes**: timestamped details/considerations on a task, so a resurfacing
+  bubbling task carries its history with it.
 - **Tags / categories** (freeform, e.g. `monitoring`, `perf`, `org`) with tag filtering.
 - Time-based **hot / decaying / dormant / bubbling** lifecycle, fully configurable.
 - **Revive** dormant tasks, or let bubbling surface them for you.
@@ -63,17 +65,18 @@ Run `zym` with no arguments to launch the interactive interface.
 | `j` / `k` / `↑` / `↓` | move selection |
 | `a` | add a task |
 | `s` | add a subtask to the current task |
+| `n` | add a note to the current task |
 | `e` | edit the selected task's title |
 | `t` | edit the selected task's tags (space-separated; empty clears all) |
-| `Enter` / `→` | expand / collapse subtasks |
+| `Enter` / `→` | expand / collapse subtasks + notes |
 | `Space` / `d` | toggle done (task or highlighted subtask) |
 | `r` | revive (mark still-relevant → hot) |
-| `x` / `Del` | delete (task, or the highlighted subtask) |
+| `x` / `Del` | delete (task, or the highlighted subtask/note) |
 | `Tab` | show / hide dormant tasks |
 | `c` | open the config screen |
 | `q` / `Esc` | quit |
 
-While typing (add / subtask / edit): `Enter` confirms, `Esc` cancels.
+While typing (add / subtask / note / edit): `Enter` confirms, `Esc` cancels.
 
 ### Config screen (`c`)
 
@@ -92,15 +95,15 @@ and per-task detail are handy for scripting and agentic tools.
 
 ```sh
 # tasks
-zym add "write the report" --note "Q3" --subtask "draft" --tag org
+zym add "write the report" --note "Q3" --note "clear with legal" --subtask "draft" --tag org
 zym list                         # active tasks (hides done + dormant)
 zym list --all                   # everything
 zym list --status decaying       # filter by lifecycle band
 zym list --tag org               # filter by tag
 zym list --json                  # machine-readable, includes derived status
-zym show 1                       # task detail with indexed subtasks + tags
+zym show 1                       # task detail with indexed subtasks, notes + tags
 zym done 1                       # mark complete
-zym edit 1 --title "..." --note "..."
+zym edit 1 --title "..."
 zym revive 1                     # still-relevant → hot
 zym rm 1
 
@@ -108,6 +111,10 @@ zym rm 1
 zym subtask add 1 "review with team"
 zym subtask done 1 2
 zym subtask rm 1 2
+
+# notes (index is 1-based, as shown by `zym show`)
+zym note add 1 "check the p99, not the mean"
+zym note rm 1 2
 
 # tags / categories (freeform, normalised to lowercase)
 zym tag add 1 monitoring

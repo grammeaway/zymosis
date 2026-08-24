@@ -38,6 +38,7 @@ enum Mode {
     Add,
     Edit(u64),
     AddSub(u64),
+    AddNote(u64),
     EditTags(u64),
     Config,
     EditCfg(CfgField),
@@ -92,11 +93,13 @@ fn apply_cfg(cfg: &Config, f: CfgField, input: &str) -> Result<Config, String> {
     Ok(next)
 }
 
-/// A rendered line: either a task or one of its subtasks (indices into `tasks`).
+/// A rendered line: a task, one of its subtasks, or one of its notes (indices
+/// into `tasks`).
 #[derive(Clone, Copy)]
 enum Row {
     Task(usize),
     Sub(usize, usize),
+    Note(usize, usize),
 }
 
 struct App {
@@ -156,6 +159,9 @@ impl App {
                 for si in 0..self.tasks[ti].subtasks.len() {
                     out.push(Row::Sub(ti, si));
                 }
+                for ni in 0..self.tasks[ti].notes.len() {
+                    out.push(Row::Note(ti, ni));
+                }
             }
         }
         out
@@ -176,7 +182,7 @@ impl App {
     /// Task index the selected row belongs to (task row, or a subtask's parent).
     fn row_task(&self) -> Option<usize> {
         match self.selected_row() {
-            Some(Row::Task(ti)) | Some(Row::Sub(ti, _)) => Some(ti),
+            Some(Row::Task(ti)) | Some(Row::Sub(ti, _)) | Some(Row::Note(ti, _)) => Some(ti),
             None => None,
         }
     }
@@ -246,6 +252,12 @@ impl App {
                 if let Some(ti) = self.row_task() {
                     self.input.clear();
                     self.mode = Mode::AddSub(self.tasks[ti].id);
+                }
+            }
+            KeyCode::Char('n') => {
+                if let Some(ti) = self.row_task() {
+                    self.input.clear();
+                    self.mode = Mode::AddNote(self.tasks[ti].id);
                 }
             }
             KeyCode::Char('e') => {
@@ -344,6 +356,7 @@ impl App {
                         Mode::Add => self.add_task(title),
                         Mode::Edit(id) => self.apply_edit(id, title),
                         Mode::AddSub(id) => self.add_subtask(id, title),
+                        Mode::AddNote(id) => self.add_note(id, title),
                         Mode::Normal | Mode::Config | Mode::EditCfg(_) | Mode::EditTags(_) => {}
                     }
                     self.persist();
@@ -393,6 +406,14 @@ impl App {
         self.expanded.insert(id); // reveal what was just added
     }
 
+    fn add_note(&mut self, id: u64, text: String) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+            t.add_note(&text);
+            t.touch();
+        }
+        self.expanded.insert(id); // reveal what was just added
+    }
+
     /// Toggle done on the highlighted row: a task, or a subtask (which also
     /// touches its parent, since interacting keeps a task relevant).
     fn toggle_selected(&mut self) -> bool {
@@ -406,7 +427,7 @@ impl App {
                 self.tasks[ti].touch();
                 true
             }
-            None => false,
+            Some(Row::Note(_, _)) | None => false, // notes have no done state
         }
     }
 
@@ -440,6 +461,10 @@ impl App {
             }
             Some(Row::Sub(ti, si)) => {
                 self.tasks[ti].subtasks.remove(si);
+                self.tasks[ti].touch();
+            }
+            Some(Row::Note(ti, ni)) => {
+                self.tasks[ti].notes.remove(ni);
                 self.tasks[ti].touch();
             }
             None => return false,
@@ -487,13 +512,24 @@ impl App {
                         let (mark, mut style) =
                             row_style(t.status(&th, now), t.age(now), &th, self.frame);
                         let (done, total) = t.progress();
-                        let expand = if total > 0 {
+                        let notes = t.notes.len();
+                        let expand = if total > 0 || notes > 0 {
                             let caret = if self.expanded.contains(&t.id) {
                                 "▾"
                             } else {
                                 "▸"
                             };
-                            format!(" {caret} [{done}/{total}]")
+                            let subs = if total > 0 {
+                                format!(" [{done}/{total}]")
+                            } else {
+                                String::new()
+                            };
+                            let ns = if notes > 0 {
+                                format!(" ✎{notes}")
+                            } else {
+                                String::new()
+                            };
+                            format!(" {caret}{subs}{ns}")
                         } else {
                             String::new()
                         };
@@ -524,6 +560,11 @@ impl App {
                         }
                         ListItem::new(Line::styled(format!("    ↳ {mark} {}", s.title), style))
                     }
+                    Row::Note(ti, ni) => {
+                        let n = &self.tasks[ti].notes[ni];
+                        let style = Style::default().fg(NOTE).add_modifier(Modifier::ITALIC);
+                        ListItem::new(Line::styled(format!("    ✎ {}", n.text), style))
+                    }
                 })
                 .collect();
 
@@ -552,6 +593,7 @@ impl App {
         let footer_line = match self.mode {
             Mode::Add => Line::from(format!("add> {}", self.input).fg(NEON_HOT)),
             Mode::AddSub(_) => Line::from(format!("subtask> {}", self.input).fg(NEON_HOT)),
+            Mode::AddNote(_) => Line::from(format!("note> {}", self.input).fg(NEON_HOT)),
             Mode::Edit(_) => Line::from(format!("edit> {}", self.input).fg(NEON_HOT)),
             Mode::EditTags(_) => Line::from(format!("tags> {}", self.input).fg(NEON_HOT)),
             Mode::EditCfg(f) => match &self.status {
@@ -565,7 +607,7 @@ impl App {
             Mode::Normal => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
                 None => Line::from(
-                    "a add · s +sub · e edit · t tags · enter expand · space done · x del · r revive · tab dormant · c config · q"
+                    "a add · s +sub · n +note · e edit · t tags · enter expand · space done · x del · r revive · tab dormant · c config · q"
                         .dim(),
                 ),
             },
@@ -622,6 +664,7 @@ const DECAY_FRESH: Color = Color::Rgb(150, 200, 210);
 const DECAY_STALE: Color = Color::Rgb(95, 95, 120);
 const DORMANT: Color = Color::Rgb(80, 80, 105);
 const SUBTASK: Color = Color::Rgb(140, 150, 170);
+const NOTE: Color = Color::Rgb(150, 170, 140);
 const TAG: Color = Color::Rgb(180, 140, 255);
 const BUBBLES: [&str; 4] = ["·", "∘", "○", "°"];
 
@@ -804,6 +847,25 @@ mod tests {
         assert_eq!(app.tasks.len(), 1); // task survives
         assert_eq!(app.tasks[0].subtasks.len(), 1);
         assert_eq!(app.tasks[0].subtasks[0].title, "b");
+    }
+
+    #[test]
+    fn add_note_appends_expands_and_note_row_is_removable() {
+        let mut app = app_with(1);
+        let id = app.tasks[0].id;
+        app.add_note(id, "  weigh the tradeoff  ".into());
+        assert_eq!(app.tasks[0].notes.len(), 1);
+        assert_eq!(app.tasks[0].notes[0].text, "weigh the tradeoff"); // trimmed
+        assert!(app.expanded.contains(&id)); // auto-revealed
+        assert_eq!(app.rows().len(), 2); // task + 1 note row
+
+        // notes have no done state: space is a no-op on a note row
+        app.selected = 1;
+        assert!(!app.toggle_selected());
+        // but the note row can be deleted
+        assert!(app.remove_selected());
+        assert!(app.tasks[0].notes.is_empty());
+        assert_eq!(app.tasks.len(), 1); // task survives
     }
 
     #[test]

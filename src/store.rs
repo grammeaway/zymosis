@@ -79,7 +79,7 @@ pub fn import(path: &Path) -> io::Result<Vec<Task>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SubTask;
+    use crate::model::{Note, SubTask};
     use proptest::prelude::*;
 
     prop_compose! {
@@ -89,10 +89,16 @@ mod tests {
     }
 
     prop_compose! {
+        fn a_note()(text in ".*", created in any::<u64>()) -> Note {
+            Note { text, created }
+        }
+    }
+
+    prop_compose! {
         fn a_task()(
             id in any::<u64>(),
             title in ".*",
-            notes in ".*",
+            notes in prop::collection::vec(a_note(), 0..4),
             created in any::<u64>(),
             last_updated in any::<u64>(),
             done in any::<bool>(),

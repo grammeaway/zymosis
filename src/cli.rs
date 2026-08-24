@@ -22,8 +22,9 @@ pub enum Command {
     /// Add a task.
     Add {
         title: String,
-        #[arg(long)]
-        note: Option<String>,
+        /// Repeatable: --note "a" --note "b".
+        #[arg(long = "note")]
+        notes: Vec<String>,
         /// Repeatable: --subtask "a" --subtask "b".
         #[arg(long = "subtask")]
         subtasks: Vec<String>,
@@ -45,13 +46,11 @@ pub enum Command {
     },
     /// Mark a task done.
     Done { id: u64 },
-    /// Edit a task's title/note (bumps it back to Hot).
+    /// Edit a task's title (bumps it back to Hot). Notes are managed with `note`.
     Edit {
         id: u64,
         #[arg(long)]
         title: Option<String>,
-        #[arg(long)]
-        note: Option<String>,
     },
     /// Mark a task still-relevant, reviving it to Hot.
     Revive { id: u64 },
@@ -75,6 +74,11 @@ pub enum Command {
         #[command(subcommand)]
         action: SubtaskCmd,
     },
+    /// Work with a task's notes (details/considerations; index is 1-based).
+    Note {
+        #[command(subcommand)]
+        action: NoteCmd,
+    },
     /// Work with a task's tags/categories.
     Tag {
         #[command(subcommand)]
@@ -88,6 +92,14 @@ pub enum TagCmd {
     Add { task_id: u64, tag: String },
     /// Remove a tag from a task.
     Rm { task_id: u64, tag: String },
+}
+
+#[derive(Subcommand)]
+pub enum NoteCmd {
+    /// Append a note.
+    Add { task_id: u64, text: String },
+    /// Remove a note.
+    Rm { task_id: u64, index: usize },
 }
 
 #[derive(Subcommand)]
@@ -179,12 +191,23 @@ fn find_mut<'a>(tasks: &'a mut [Task], id: u64) -> Result<&'a mut Task, String> 
         .ok_or_else(|| format!("no task with id {id}"))
 }
 
-/// Resolve a 1-based subtask index to a 0-based slot, or a clear error.
-fn sub_index(t: &Task, index: usize, task_id: u64) -> Result<usize, String> {
+/// Resolve a 1-based index into a 0-based slot within `len`, or a clear error.
+fn one_based(index: usize, len: usize, what: &str, task_id: u64) -> Result<usize, String> {
     index
         .checked_sub(1)
-        .filter(|&i| i < t.subtasks.len())
-        .ok_or_else(|| format!("no subtask {index} on task {task_id}"))
+        .filter(|&i| i < len)
+        .ok_or_else(|| format!("no {what} {index} on task {task_id}"))
+}
+
+/// Compact relative age ("3d ago") using the largest whole unit.
+fn ago(now: Timestamp, then: Timestamp) -> String {
+    let secs = now.saturating_sub(then);
+    for (unit, size) in [("w", 604_800u64), ("d", 86_400), ("h", 3600), ("m", 60)] {
+        if secs >= size {
+            return format!("{}{unit} ago", secs / size);
+        }
+    }
+    "just now".into()
 }
 
 fn io_err<E: std::fmt::Display>(e: E) -> String {
@@ -216,13 +239,13 @@ pub fn run(cmd: Command) -> Result<(), String> {
     match cmd {
         Command::Add {
             title,
-            note,
+            notes,
             subtasks,
             tags,
         } => {
             let mut task = Task::new(Task::next_id(&tasks), title);
-            if let Some(n) = note {
-                task.notes = n;
+            for n in &notes {
+                task.add_note(n);
             }
             task.subtasks = subtasks
                 .into_iter()
@@ -281,13 +304,10 @@ pub fn run(cmd: Command) -> Result<(), String> {
             store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
             println!("marked task {id} done");
         }
-        Command::Edit { id, title, note } => {
+        Command::Edit { id, title } => {
             let t = find_mut(&mut tasks, id)?;
             if let Some(title) = title {
                 t.title = title;
-            }
-            if let Some(note) = note {
-                t.notes = note;
             }
             t.touch();
             store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
@@ -335,7 +355,10 @@ pub fn run(cmd: Command) -> Result<(), String> {
                 println!("tags:  {}", tag_suffix(t).trim());
             }
             if !t.notes.is_empty() {
-                println!("notes:  {}", t.notes);
+                println!("notes:");
+                for (i, n) in t.notes.iter().enumerate() {
+                    println!("  {:>2}. {}  ({})", i + 1, n.text, ago(now, n.created));
+                }
             }
             if t.subtasks.is_empty() {
                 println!("(no subtasks)");
@@ -356,14 +379,14 @@ pub fn run(cmd: Command) -> Result<(), String> {
                 }
                 SubtaskCmd::Done { task_id, index } => {
                     let t = find_mut(&mut tasks, task_id)?;
-                    let i = sub_index(t, index, task_id)?;
+                    let i = one_based(index, t.subtasks.len(), "subtask", task_id)?;
                     t.subtasks[i].done = !t.subtasks[i].done;
                     t.touch();
                     format!("toggled subtask {index} on task {task_id}")
                 }
                 SubtaskCmd::Rm { task_id, index } => {
                     let t = find_mut(&mut tasks, task_id)?;
-                    let i = sub_index(t, index, task_id)?;
+                    let i = one_based(index, t.subtasks.len(), "subtask", task_id)?;
                     t.subtasks.remove(i);
                     t.touch();
                     format!("removed subtask {index} from task {task_id}")
@@ -389,6 +412,27 @@ pub fn run(cmd: Command) -> Result<(), String> {
                     }
                     t.touch();
                     format!("untagged task {task_id}")
+                }
+            };
+            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            println!("{msg}");
+        }
+        Command::Note { action } => {
+            let msg = match action {
+                NoteCmd::Add { task_id, text } => {
+                    let t = find_mut(&mut tasks, task_id)?;
+                    if !t.add_note(&text) {
+                        return Err(format!("note text for task {task_id} is empty"));
+                    }
+                    t.touch();
+                    format!("noted task {task_id}")
+                }
+                NoteCmd::Rm { task_id, index } => {
+                    let t = find_mut(&mut tasks, task_id)?;
+                    let i = one_based(index, t.notes.len(), "note", task_id)?;
+                    t.notes.remove(i);
+                    t.touch();
+                    format!("removed note {index} from task {task_id}")
                 }
             };
             store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
@@ -420,22 +464,19 @@ mod tests {
     }
 
     #[test]
-    fn sub_index_is_one_based_and_bounded() {
-        let mut t = Task::new(1, "x");
-        t.subtasks = vec![
-            model::SubTask {
-                title: "a".into(),
-                done: false,
-            },
-            model::SubTask {
-                title: "b".into(),
-                done: false,
-            },
-        ];
-        assert_eq!(sub_index(&t, 1, 1).unwrap(), 0);
-        assert_eq!(sub_index(&t, 2, 1).unwrap(), 1);
-        assert!(sub_index(&t, 0, 1).is_err()); // 0 is not valid (1-based)
-        assert!(sub_index(&t, 3, 1).is_err()); // out of range
+    fn one_based_is_one_based_and_bounded() {
+        assert_eq!(one_based(1, 2, "subtask", 1).unwrap(), 0);
+        assert_eq!(one_based(2, 2, "subtask", 1).unwrap(), 1);
+        assert!(one_based(0, 2, "subtask", 1).is_err()); // 0 is not valid (1-based)
+        assert!(one_based(3, 2, "subtask", 1).is_err()); // out of range
+    }
+
+    #[test]
+    fn ago_picks_largest_whole_unit() {
+        assert_eq!(ago(100, 100), "just now");
+        assert_eq!(ago(3 * 86_400 + 5, 0), "3d ago");
+        assert_eq!(ago(90 * 60, 0), "1h ago");
+        assert_eq!(ago(50, 100), "just now"); // clock jumped back: saturates
     }
 
     #[test]
