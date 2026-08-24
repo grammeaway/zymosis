@@ -20,7 +20,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::{self, Config};
-use crate::model::{self, Status, Task, Thresholds};
+use crate::model::{self, Status, SubTask, Task, Thresholds};
 use crate::store;
 
 pub fn run() -> Result<(), String> {
@@ -37,6 +37,7 @@ enum Mode {
     Normal,
     Add,
     Edit(u64),
+    AddSub(u64),
 }
 
 /// A rendered line: either a task or one of its subtasks (indices into `tasks`).
@@ -118,6 +119,14 @@ impl App {
         }
     }
 
+    /// Task index the selected row belongs to (task row, or a subtask's parent).
+    fn row_task(&self) -> Option<usize> {
+        match self.selected_row() {
+            Some(Row::Task(ti)) | Some(Row::Sub(ti, _)) => Some(ti),
+            None => None,
+        }
+    }
+
     fn has_animation(&self) -> bool {
         let now = model::now();
         let th = self.cfg.thresholds();
@@ -139,7 +148,7 @@ impl App {
                     if k.kind == KeyEventKind::Press {
                         match self.mode {
                             Mode::Normal => self.on_normal_key(k.code),
-                            Mode::Add | Mode::Edit(_) => self.on_input_key(k.code),
+                            _ => self.on_input_key(k.code),
                         }
                         dirty = true;
                     }
@@ -169,6 +178,12 @@ impl App {
             KeyCode::Char('a') => {
                 self.input.clear();
                 self.mode = Mode::Add;
+            }
+            KeyCode::Char('s') => {
+                if let Some(ti) = self.row_task() {
+                    self.input.clear();
+                    self.mode = Mode::AddSub(self.tasks[ti].id);
+                }
             }
             KeyCode::Char('e') => {
                 if let Some(i) = self.selected_task() {
@@ -211,6 +226,7 @@ impl App {
                     match self.mode {
                         Mode::Add => self.add_task(title),
                         Mode::Edit(id) => self.apply_edit(id, title),
+                        Mode::AddSub(id) => self.add_subtask(id, title),
                         Mode::Normal => {}
                     }
                     self.persist();
@@ -235,6 +251,14 @@ impl App {
             t.touch();
         }
         self.selected = 0;
+    }
+
+    fn add_subtask(&mut self, id: u64, title: String) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+            t.subtasks.push(SubTask { title, done: false });
+            t.touch();
+        }
+        self.expanded.insert(id); // reveal what was just added
     }
 
     /// Toggle done on the highlighted row: a task, or a subtask (which also
@@ -274,16 +298,22 @@ impl App {
         }
     }
 
+    /// Delete the highlighted row: a task (with its subtasks), or a single
+    /// subtask (touching its parent).
     fn remove_selected(&mut self) -> bool {
-        match self.selected_task() {
-            Some(ti) => {
+        match self.selected_row() {
+            Some(Row::Task(ti)) => {
                 self.expanded.remove(&self.tasks[ti].id);
                 self.tasks.remove(ti);
-                self.selected = self.selected.min(self.rows().len().saturating_sub(1));
-                true
             }
-            None => false,
+            Some(Row::Sub(ti, si)) => {
+                self.tasks[ti].subtasks.remove(si);
+                self.tasks[ti].touch();
+            }
+            None => return false,
         }
+        self.selected = self.selected.min(self.rows().len().saturating_sub(1));
+        true
     }
 
     fn persist(&mut self) {
@@ -358,11 +388,12 @@ impl App {
 
         let footer_line = match self.mode {
             Mode::Add => Line::from(format!("add> {}", self.input).fg(NEON_HOT)),
+            Mode::AddSub(_) => Line::from(format!("subtask> {}", self.input).fg(NEON_HOT)),
             Mode::Edit(_) => Line::from(format!("edit> {}", self.input).fg(NEON_HOT)),
             Mode::Normal => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
                 None => Line::from(
-                    "a add · e edit · enter expand · d/space done · r revive · x del · tab dormant · q quit"
+                    "a add · s +sub · e edit · enter expand · space done · x del · r revive · tab dormant · q"
                         .dim(),
                 ),
             },
@@ -528,6 +559,31 @@ mod tests {
         assert!(app.toggle_selected());
         assert!(app.tasks[0].subtasks[0].done);
         assert!(!app.tasks[0].subtasks[1].done);
+    }
+
+    #[test]
+    fn add_subtask_appends_and_expands() {
+        let mut app = app_with(1);
+        let id = app.tasks[0].id;
+        app.add_subtask(id, "first".into());
+        assert_eq!(app.tasks[0].subtasks.len(), 1);
+        assert!(app.expanded.contains(&id)); // auto-revealed
+        assert_eq!(app.rows().len(), 2); // task + 1 subtask
+    }
+
+    #[test]
+    fn remove_on_subtask_row_deletes_only_the_subtask() {
+        let mut app = app_with(1);
+        app.tasks[0].subtasks = vec![
+            SubTask { title: "a".into(), done: false },
+            SubTask { title: "b".into(), done: false },
+        ];
+        app.toggle_expand(); // selected is task row 0
+        app.selected = 1; // first subtask row
+        assert!(app.remove_selected());
+        assert_eq!(app.tasks.len(), 1); // task survives
+        assert_eq!(app.tasks[0].subtasks.len(), 1);
+        assert_eq!(app.tasks[0].subtasks[0].title, "b");
     }
 
     #[test]
