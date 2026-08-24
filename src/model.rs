@@ -63,6 +63,15 @@ pub struct Task {
     pub done: bool,
     #[serde(default)]
     pub subtasks: Vec<SubTask>,
+    /// Freeform categories, normalized lowercase (e.g. "monitoring", "perf").
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Normalize a tag: trimmed + lowercased, or `None` if empty.
+pub fn normalize_tag(s: &str) -> Option<String> {
+    let t = s.trim().to_lowercase();
+    (!t.is_empty()).then_some(t)
 }
 
 impl Task {
@@ -76,7 +85,31 @@ impl Task {
             last_updated: ts,
             done: false,
             subtasks: Vec::new(),
+            tags: Vec::new(),
         }
+    }
+
+    /// Add a tag (normalized, deduped). Returns whether it was newly added.
+    pub fn add_tag(&mut self, tag: &str) -> bool {
+        match normalize_tag(tag) {
+            Some(t) if !self.tags.contains(&t) => {
+                self.tags.push(t);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove a tag. Returns whether one was removed.
+    pub fn remove_tag(&mut self, tag: &str) -> bool {
+        let Some(t) = normalize_tag(tag) else { return false };
+        let before = self.tags.len();
+        self.tags.retain(|x| x != &t);
+        self.tags.len() != before
+    }
+
+    pub fn has_tag(&self, tag: &str) -> bool {
+        normalize_tag(tag).is_some_and(|t| self.tags.contains(&t))
     }
 
     /// Mark freshly relevant (revive / "still relevant"): resets age to Hot.
@@ -141,6 +174,18 @@ mod tests {
                 bubble_after: Duration::from_secs(bub),
             }
         }
+    }
+
+    #[test]
+    fn tags_normalize_and_dedup() {
+        let mut t = Task::new(1, "x");
+        assert!(t.add_tag("  Monitoring "));
+        assert!(!t.add_tag("monitoring")); // dup after normalize
+        assert!(!t.add_tag("   ")); // empty ignored
+        assert_eq!(t.tags, vec!["monitoring"]);
+        assert!(t.has_tag("MONITORING"));
+        assert!(t.remove_tag("monitoring"));
+        assert!(t.tags.is_empty());
     }
 
     proptest! {

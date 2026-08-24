@@ -15,7 +15,7 @@ use std::time::Duration;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
@@ -355,7 +355,14 @@ impl App {
                     if t.done {
                         style = style.add_modifier(Modifier::CROSSED_OUT | Modifier::DIM);
                     }
-                    ListItem::new(Line::styled(format!("{mark} {}{expand}", t.title), style))
+                    let mut spans =
+                        vec![Span::styled(format!("{mark} {}{expand}", t.title), style)];
+                    if !t.tags.is_empty() {
+                        let chips =
+                            t.tags.iter().map(|x| format!("#{x}")).collect::<Vec<_>>().join(" ");
+                        spans.push(Span::styled(format!("  {chips}"), Style::default().fg(TAG)));
+                    }
+                    ListItem::new(Line::from(spans))
                 }
                 Row::Sub(ti, si) => {
                     let s = &self.tasks[ti].subtasks[si];
@@ -427,6 +434,7 @@ const DECAY_FRESH: Color = Color::Rgb(150, 200, 210);
 const DECAY_STALE: Color = Color::Rgb(95, 95, 120);
 const DORMANT: Color = Color::Rgb(80, 80, 105);
 const SUBTASK: Color = Color::Rgb(140, 150, 170);
+const TAG: Color = Color::Rgb(180, 140, 255);
 const BUBBLES: [&str; 4] = ["·", "∘", "○", "°"];
 
 fn to_rgb(c: Color) -> (u8, u8, u8) {

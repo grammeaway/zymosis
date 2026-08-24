@@ -94,8 +94,9 @@ mod tests {
             last_updated in any::<u64>(),
             done in any::<bool>(),
             subtasks in prop::collection::vec(a_subtask(), 0..5),
+            tags in prop::collection::vec("[a-z]{1,8}", 0..4),
         ) -> Task {
-            Task { id, title, notes, created, last_updated, done, subtasks }
+            Task { id, title, notes, created, last_updated, done, subtasks, tags }
         }
     }
 

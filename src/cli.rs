@@ -27,11 +27,17 @@ pub enum Command {
         /// Repeatable: --subtask "a" --subtask "b".
         #[arg(long = "subtask")]
         subtasks: Vec<String>,
+        /// Repeatable: --tag monitoring --tag perf.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
     /// List tasks (hides done + dormant by default).
     List {
         #[arg(long, value_enum)]
         status: Option<StatusFilter>,
+        /// Only tasks carrying this tag.
+        #[arg(long)]
+        tag: Option<String>,
         #[arg(long)]
         all: bool,
         #[arg(long)]
@@ -69,6 +75,19 @@ pub enum Command {
         #[command(subcommand)]
         action: SubtaskCmd,
     },
+    /// Work with a task's tags/categories.
+    Tag {
+        #[command(subcommand)]
+        action: TagCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TagCmd {
+    /// Add a tag to a task.
+    Add { task_id: u64, tag: String },
+    /// Remove a tag from a task.
+    Rm { task_id: u64, tag: String },
 }
 
 #[derive(Subcommand)]
@@ -93,6 +112,15 @@ fn status_of(t: &Task, cfg: &Config, now: Timestamp) -> Status {
     t.status(&cfg.thresholds(), now)
 }
 
+/// Trailing "  #a #b" for display, or empty when untagged.
+fn tag_suffix(t: &Task) -> String {
+    if t.tags.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", t.tags.iter().map(|x| format!("#{x}")).collect::<Vec<_>>().join(" "))
+    }
+}
+
 fn status_str(s: Status) -> &'static str {
     match s {
         Status::Hot => "hot",
@@ -107,12 +135,18 @@ fn select<'a>(
     tasks: &'a [Task],
     cfg: &Config,
     filter: Option<StatusFilter>,
+    tag: Option<&str>,
     all: bool,
     now: Timestamp,
 ) -> Vec<&'a Task> {
     let mut view: Vec<&Task> = tasks
         .iter()
         .filter(|t| {
+            if let Some(tg) = tag {
+                if !t.has_tag(tg) {
+                    return false;
+                }
+            }
             let st = status_of(t, cfg, now);
             match filter {
                 Some(f) => matches!(
@@ -173,7 +207,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
     let now = model::now();
 
     match cmd {
-        Command::Add { title, note, subtasks } => {
+        Command::Add { title, note, subtasks, tags } => {
             let mut task = Task::new(Task::next_id(&tasks), title);
             if let Some(n) = note {
                 task.notes = n;
@@ -182,13 +216,16 @@ pub fn run(cmd: Command) -> Result<(), String> {
                 .into_iter()
                 .map(|title| model::SubTask { title, done: false })
                 .collect();
+            for tag in &tags {
+                task.add_tag(tag);
+            }
             let id = task.id;
             tasks.push(task);
             store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
             println!("added task {id}");
         }
-        Command::List { status, all, json } => {
-            let view = select(&tasks, &cfg, status, all, now);
+        Command::List { status, tag, all, json } => {
+            let view = select(&tasks, &cfg, status, tag.as_deref(), all, now);
             if json {
                 let out: Vec<TaskView> = view
                     .iter()
@@ -202,13 +239,15 @@ pub fn run(cmd: Command) -> Result<(), String> {
                     let (done, total) = t.progress();
                     let prog = if total > 0 { format!(" [{done}/{total}]") } else { String::new() };
                     let mark = if t.done { "x" } else { " " };
+                    let tags = tag_suffix(t);
                     println!(
-                        "{:>4} [{}] {:8} {}{}",
+                        "{:>4} [{}] {:8} {}{}{}",
                         t.id,
                         mark,
                         status_str(status_of(t, &cfg, now)),
                         t.title,
-                        prog
+                        prog,
+                        tags
                     );
                 }
             }
@@ -268,6 +307,9 @@ pub fn run(cmd: Command) -> Result<(), String> {
             let mark = if t.done { "x" } else { " " };
             println!("#{} [{}] {}", t.id, mark, t.title);
             println!("status: {}", status_str(status_of(t, &cfg, now)));
+            if !t.tags.is_empty() {
+                println!("tags:  {}", tag_suffix(t).trim());
+            }
             if !t.notes.is_empty() {
                 println!("notes:  {}", t.notes);
             }
@@ -301,6 +343,28 @@ pub fn run(cmd: Command) -> Result<(), String> {
                     t.subtasks.remove(i);
                     t.touch();
                     format!("removed subtask {index} from task {task_id}")
+                }
+            };
+            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            println!("{msg}");
+        }
+        Command::Tag { action } => {
+            let msg = match action {
+                TagCmd::Add { task_id, tag } => {
+                    let t = find_mut(&mut tasks, task_id)?;
+                    if !t.add_tag(&tag) {
+                        return Err(format!("task {task_id} already has tag or tag is empty"));
+                    }
+                    t.touch();
+                    format!("tagged task {task_id}")
+                }
+                TagCmd::Rm { task_id, tag } => {
+                    let t = find_mut(&mut tasks, task_id)?;
+                    if !t.remove_tag(&tag) {
+                        return Err(format!("task {task_id} has no tag '{tag}'"));
+                    }
+                    t.touch();
+                    format!("untagged task {task_id}")
                 }
             };
             store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
@@ -360,14 +424,15 @@ mod tests {
             aged(2, 0, true),          // hot but done
             aged(3, 20 * day, false),  // dormant
         ];
-        let ids: Vec<u64> = select(&tasks, &cfg, None, false, now).iter().map(|t| t.id).collect();
+        let ids: Vec<u64> =
+            select(&tasks, &cfg, None, None, false, now).iter().map(|t| t.id).collect();
         assert_eq!(ids, vec![1]);
 
         // --all shows everything
-        assert_eq!(select(&tasks, &cfg, None, true, now).len(), 3);
+        assert_eq!(select(&tasks, &cfg, None, None, true, now).len(), 3);
 
         // status filter targets a band regardless of done/dormant defaults
-        let dormant: Vec<u64> = select(&tasks, &cfg, Some(StatusFilter::Dormant), false, now)
+        let dormant: Vec<u64> = select(&tasks, &cfg, Some(StatusFilter::Dormant), None, false, now)
             .iter()
             .map(|t| t.id)
             .collect();
@@ -375,11 +440,28 @@ mod tests {
     }
 
     #[test]
+    fn select_filters_by_tag() {
+        let cfg = Config::default();
+        let now = NOW;
+        let mut a = aged(1, 0, false);
+        a.add_tag("perf");
+        let mut b = aged(2, 0, false);
+        b.add_tag("org");
+        let tasks = vec![a, b];
+        let ids: Vec<u64> = select(&tasks, &cfg, None, Some("perf"), false, now)
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[test]
     fn select_sorts_recent_first() {
         let cfg = Config::default();
         let now = NOW;
         let tasks = vec![aged(1, 500, false), aged(2, 10, false), aged(3, 100, false)];
-        let ids: Vec<u64> = select(&tasks, &cfg, None, true, now).iter().map(|t| t.id).collect();
+        let ids: Vec<u64> =
+            select(&tasks, &cfg, None, None, true, now).iter().map(|t| t.id).collect();
         assert_eq!(ids, vec![2, 3, 1]);
     }
 }
