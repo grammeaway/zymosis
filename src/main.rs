@@ -1,13 +1,23 @@
-// Temporary: model/store/config are exercised by tests and later phases before
-// main() wires them in. Removed in Phase 4 once the CLI uses everything.
-#![allow(dead_code)]
-
 mod cli;
 mod config;
 mod model;
 mod store;
 
+use clap::Parser;
+
 fn main() {
-    // Phase 4 wires CLI dispatch here; TUI is a later phase.
-    println!("zym: scaffold in place");
+    let args = cli::Cli::parse();
+    match args.command {
+        Some(cmd) => {
+            if let Err(e) = cli::run(cmd) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        None => {
+            // Interactive TUI is a later phase.
+            eprintln!("zym: interactive TUI not implemented yet — run `zym --help` for CLI commands");
+            std::process::exit(2);
+        }
+    }
 }
