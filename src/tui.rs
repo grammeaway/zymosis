@@ -35,6 +35,7 @@ pub fn run() -> Result<(), String> {
 
 enum Mode {
     Normal,
+    Help,
     Add,
     Edit(u64),
     AddSub(u64),
@@ -255,6 +256,7 @@ impl App {
                     if k.kind == KeyEventKind::Press {
                         match self.mode {
                             Mode::Normal => self.on_normal_key(k.code),
+                            Mode::Help => self.mode = Mode::Normal, // any key closes help
                             Mode::Config => self.on_config_key(k.code),
                             _ => self.on_input_key(k.code),
                         }
@@ -329,6 +331,8 @@ impl App {
                 self.cfg_sel = 0;
                 self.mode = Mode::Config;
             }
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('y') => self.yank_selected(),
             KeyCode::Char('x') | KeyCode::Delete => {
                 if self.remove_selected() {
                     self.persist();
@@ -401,7 +405,7 @@ impl App {
                         Mode::Edit(id) => self.apply_edit(id, title),
                         Mode::AddSub(id) => self.add_subtask(id, title),
                         Mode::AddNote(id) => self.add_note(id, title),
-                        Mode::Normal | Mode::Config | Mode::EditCfg(_) | Mode::EditTags(_) => {}
+                        Mode::Normal | Mode::Help | Mode::Config | Mode::EditCfg(_) | Mode::EditTags(_) => {}
                     }
                     self.persist();
                 }
@@ -520,6 +524,21 @@ impl App {
         true
     }
 
+    /// Copy the selected row's text (task title, subtask title, or note) to the
+    /// system clipboard via OSC 52 — terminal-native, no deps, works over SSH.
+    fn yank_selected(&mut self) {
+        let text = match self.selected_row() {
+            Some(Row::Task(ti)) => Some(self.tasks[ti].title.clone()),
+            Some(Row::Sub(ti, si)) => Some(self.tasks[ti].subtasks[si].title.clone()),
+            Some(Row::Note(ti, ni)) => Some(self.tasks[ti].notes[ni].text.clone()),
+            None => None,
+        };
+        if let Some(t) = text {
+            copy_to_clipboard(&t);
+            self.status = Some(format!("yanked: {}", tail(&t, 40)));
+        }
+    }
+
     fn persist(&mut self) {
         if let Err(e) = store::save(&self.cfg.storage_path, &self.tasks) {
             self.status = Some(format!("save failed: {e}"));
@@ -570,7 +589,9 @@ impl App {
 
         f.render_widget(Paragraph::new(self.banner()), header);
 
-        if matches!(self.mode, Mode::Config | Mode::EditCfg(_)) {
+        if matches!(self.mode, Mode::Help) {
+            self.draw_help(f, body);
+        } else if matches!(self.mode, Mode::Config | Mode::EditCfg(_)) {
             self.draw_config(f, body);
         } else {
             let rows = self.rows();
@@ -665,29 +686,71 @@ impl App {
         }
 
         let hot = self.theme.hot;
+        // Tail long inputs so the cursor end stays on screen (footer is one line).
+        let w = footer.width as usize;
+        let prompt = |label: &str, s: &str| Line::from(tail(&format!("{label}> {s}"), w).fg(hot));
         let footer_line = match self.mode {
-            Mode::Add => Line::from(format!("add> {}", self.input).fg(hot)),
-            Mode::AddSub(_) => Line::from(format!("subtask> {}", self.input).fg(hot)),
-            Mode::AddNote(_) => Line::from(format!("note> {}", self.input).fg(hot)),
-            Mode::Edit(_) => Line::from(format!("edit> {}", self.input).fg(hot)),
-            Mode::EditTags(_) => Line::from(format!("tags> {}", self.input).fg(hot)),
+            Mode::Add => prompt("add", &self.input),
+            Mode::AddSub(_) => prompt("subtask", &self.input),
+            Mode::AddNote(_) => prompt("note", &self.input),
+            Mode::Edit(_) => prompt("edit", &self.input),
+            Mode::EditTags(_) => prompt("tags", &self.input),
             Mode::EditCfg(f) => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
-                None => Line::from(format!("{}> {}", CFG_FIELDS[cfg_field_index(f)].1, self.input).fg(hot)),
+                None => prompt(CFG_FIELDS[cfg_field_index(f)].1, &self.input),
             },
             Mode::Config => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
                 None => Line::from("↑↓ select · enter edit · esc back".dim()),
             },
+            Mode::Help => Line::from("any key to close".dim()),
             Mode::Normal => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
                 None => Line::from(
-                    "a add · s +sub · n +note · e edit · t tags · enter expand · space done · x del · r revive · tab view · c config · q"
-                        .dim(),
+                    "? help · a add · e edit · y yank · space done · tab view · q quit".dim(),
                 ),
             },
         };
         f.render_widget(Paragraph::new(footer_line), footer);
+    }
+
+    fn draw_help(&self, f: &mut Frame, body: ratatui::layout::Rect) {
+        let head = |s: &'static str| Line::from(s.fg(self.theme.accent).add_modifier(Modifier::BOLD));
+        let key = |k: &'static str, desc: &'static str| {
+            Line::from(vec![
+                Span::styled(format!("  {k:10}"), Style::default().fg(self.theme.tag)),
+                Span::raw(desc),
+            ])
+        };
+        let lines = vec![
+            head("navigation"),
+            key("j/k ↑/↓", "move selection"),
+            key("tab", "cycle active → dormant → done"),
+            key("enter/→", "expand subtasks & notes"),
+            Line::from(""),
+            head("tasks"),
+            key("a", "add task"),
+            key("e", "edit title"),
+            key("t", "edit tags"),
+            key("space/d", "toggle done"),
+            key("r", "revive (from dormant/done)"),
+            key("x/del", "delete"),
+            Line::from(""),
+            head("subtasks & notes"),
+            key("s", "add subtask"),
+            key("n", "add note"),
+            key("space", "toggle subtask done"),
+            Line::from(""),
+            head("other"),
+            key("y", "yank selected to clipboard"),
+            key("c", "config"),
+            key("?", "this help"),
+            key("q/esc", "quit"),
+        ];
+        f.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" help ")),
+            body,
+        );
     }
 
     fn draw_config(&self, f: &mut Frame, body: ratatui::layout::Rect) {
@@ -712,6 +775,42 @@ impl App {
             );
         f.render_stateful_widget(list, body, &mut state);
     }
+}
+
+/// Keep the trailing `width` chars so the end of a long input stays visible.
+fn tail(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n <= width {
+        return s.to_string();
+    }
+    s.chars().skip(n - width).collect()
+}
+
+/// Copy `text` to the system clipboard via the OSC 52 terminal escape. Portable
+/// (works over SSH, no X/Wayland/pbcopy fork) and dependency-free.
+// ponytail: OSC 52 needs terminal support (kitty/iterm2/wezterm/tmux, etc.);
+// add an arboard fallback only if a target terminal turns out not to honor it.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = ((c[0] as u32) << 16)
+            | ((*c.get(1).unwrap_or(&0) as u32) << 8)
+            | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 fn move_selection(cur: usize, len: usize, delta: i32) -> usize {
@@ -968,6 +1067,40 @@ mod tests {
 
     fn th() -> Thresholds {
         Config::default().thresholds()
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        // RFC 4648 test vectors, incl. the three padding cases.
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn tail_keeps_trailing_chars() {
+        assert_eq!(tail("short", 10), "short");
+        assert_eq!(tail("abcdef", 3), "def");
+        // char-aware, not byte-aware
+        assert_eq!(tail("aééé", 2), "éé");
+    }
+
+    #[test]
+    fn yank_sets_status_for_each_row_kind() {
+        let mut app = app_with(1);
+        app.tasks[0].subtasks = vec![SubTask { title: "sub".into(), done: false }];
+        app.add_note(app.tasks[0].id, "a note".into()); // auto-expands
+        app.selected = 0;
+        app.yank_selected();
+        assert_eq!(app.status.as_deref(), Some("yanked: t0"));
+        app.selected = 1; // subtask row
+        app.yank_selected();
+        assert_eq!(app.status.as_deref(), Some("yanked: sub"));
+        app.selected = 2; // note row
+        app.yank_selected();
+        assert_eq!(app.status.as_deref(), Some("yanked: a note"));
     }
 
     #[test]
