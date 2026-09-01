@@ -41,6 +41,7 @@ enum Mode {
     AddSub(u64),
     AddNote(u64),
     EditTags(u64),
+    Search,
     Config,
     EditCfg(CfgField),
 }
@@ -147,6 +148,7 @@ struct App {
     view: View,
     expanded: HashSet<u64>,
     cfg_sel: usize,
+    g_pending: bool, // saw a lone `g`, waiting for the second in `gg`
     frame: u64,
     quit: bool,
 }
@@ -166,6 +168,7 @@ impl App {
             view: View::Active,
             expanded: HashSet::new(),
             cfg_sel: 0,
+            g_pending: false,
             frame: 0,
             quit: false,
         }
@@ -278,8 +281,22 @@ impl App {
     fn on_normal_key(&mut self, code: KeyCode) {
         self.status = None;
         let rows = self.rows().len();
+        // Any key but a second `g` breaks a pending `gg`.
+        let g_was_pending = std::mem::take(&mut self.g_pending);
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('g') => {
+                if g_was_pending {
+                    self.selected = 0; // gg → top
+                } else {
+                    self.g_pending = true;
+                }
+            }
+            KeyCode::Char('G') => self.selected = rows.saturating_sub(1), // bottom
+            KeyCode::Char('/') => {
+                self.clear_input();
+                self.mode = Mode::Search;
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected = move_selection(self.selected, rows, 1)
             }
@@ -401,6 +418,12 @@ impl App {
                 self.input.insert(b, c);
                 self.cursor += 1;
             }
+            // Search confirms in place: selection already tracked the first
+            // match incrementally as you typed.
+            KeyCode::Enter if matches!(self.mode, Mode::Search) => {
+                self.mode = Mode::Normal;
+                self.clear_input();
+            }
             // Config edits parse/validate and stay on the config screen; a bad
             // value shows an error and keeps the input for a retry.
             KeyCode::Enter if matches!(self.mode, Mode::EditCfg(_)) => {
@@ -435,7 +458,8 @@ impl App {
                         | Mode::Help
                         | Mode::Config
                         | Mode::EditCfg(_)
-                        | Mode::EditTags(_) => {}
+                        | Mode::EditTags(_)
+                        | Mode::Search => {}
                     }
                     self.persist();
                 }
@@ -444,6 +468,27 @@ impl App {
             }
             _ => {}
         }
+        // Incremental search: keep the highlight on the first match as the
+        // query changes (Esc/Enter already left Search mode, so this is skipped).
+        if matches!(self.mode, Mode::Search) {
+            if let Some(i) = self.find_match(&self.input) {
+                self.selected = i;
+            }
+        }
+    }
+
+    /// Row index of the first task matching `query` (case-insensitive substring
+    /// of the title or any tag). None when the query is empty or nothing hits.
+    fn find_match(&self, query: &str) -> Option<usize> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return None;
+        }
+        self.rows().iter().position(|r| {
+            matches!(r, Row::Task(ti) if
+                self.tasks[*ti].title.to_lowercase().contains(&q)
+                    || self.tasks[*ti].tags.iter().any(|t| t.contains(&q)))
+        })
     }
 
     fn clear_input(&mut self) {
@@ -454,6 +499,20 @@ impl App {
     fn set_input(&mut self, s: String) {
         self.cursor = s.chars().count();
         self.input = s;
+    }
+
+    /// Move the top-level highlight onto the task with `id` after an
+    /// interaction re-sorts the list, so selection follows the task it acted
+    /// on. Falls back to clamping when the task left the current view.
+    fn select_task(&mut self, id: u64) {
+        let rows = self.rows();
+        match rows
+            .iter()
+            .position(|r| matches!(r, Row::Task(ti) if self.tasks[*ti].id == id))
+        {
+            Some(i) => self.selected = i,
+            None => self.selected = self.selected.min(rows.len().saturating_sub(1)),
+        }
     }
 
     // --- pure mutations (no I/O; caller persists) ---
@@ -469,7 +528,7 @@ impl App {
             t.title = title;
             t.touch();
         }
-        self.selected = 0;
+        self.select_task(id);
     }
 
     /// Re-set a task's whole tag set from a space-separated input, reusing
@@ -483,7 +542,7 @@ impl App {
             }
             t.touch();
         }
-        self.selected = 0;
+        self.select_task(id);
     }
 
     fn add_subtask(&mut self, id: u64, title: String) {
@@ -492,6 +551,7 @@ impl App {
             t.touch();
         }
         self.expanded.insert(id); // reveal what was just added
+        self.select_task(id); // follow the task it jumped to the top
     }
 
     fn add_note(&mut self, id: u64, text: String) {
@@ -500,6 +560,7 @@ impl App {
             t.touch();
         }
         self.expanded.insert(id); // reveal what was just added
+        self.select_task(id); // follow the task it jumped to the top
     }
 
     /// Toggle done on the highlighted row: a task, or a subtask (which also
@@ -535,7 +596,8 @@ impl App {
             Some(ti) => {
                 self.tasks[ti].done = false;
                 self.tasks[ti].touch();
-                self.selected = 0;
+                let id = self.tasks[ti].id;
+                self.select_task(id);
                 true
             }
             None => false,
@@ -727,20 +789,22 @@ impl App {
 
         let hot = self.theme.hot;
         let w = footer.width as usize;
-        // Label for whichever mode is taking text input (None = not editing).
-        let input_label = match self.mode {
-            Mode::Add => Some("add"),
-            Mode::AddSub(_) => Some("subtask"),
-            Mode::AddNote(_) => Some("note"),
-            Mode::Edit(_) => Some("edit"),
-            Mode::EditTags(_) => Some("tags"),
-            Mode::EditCfg(f) if self.status.is_none() => Some(CFG_FIELDS[cfg_field_index(f)].1),
+        // Prompt prefix for whichever mode is taking text input (None = not editing).
+        let input_prefix = match self.mode {
+            Mode::Add => Some("add> ".to_string()),
+            Mode::AddSub(_) => Some("subtask> ".to_string()),
+            Mode::AddNote(_) => Some("note> ".to_string()),
+            Mode::Edit(_) => Some("edit> ".to_string()),
+            Mode::EditTags(_) => Some("tags> ".to_string()),
+            Mode::Search => Some("/".to_string()),
+            Mode::EditCfg(f) if self.status.is_none() => {
+                Some(format!("{}> ", CFG_FIELDS[cfg_field_index(f)].1))
+            }
             _ => None,
         };
-        if let Some(label) = input_label {
+        if let Some(prefix) = input_prefix {
             // Scroll horizontally so the cursor stays visible, then place the
             // real terminal cursor at its column.
-            let prefix = format!("{label}> ");
             let (vis, col) = input_window(&prefix, &self.input, self.cursor, w);
             f.render_widget(Paragraph::new(Line::from(vis.fg(hot))), footer);
             f.set_cursor_position((footer.x + col as u16, footer.y));
@@ -780,6 +844,8 @@ impl App {
         let lines = vec![
             head("navigation"),
             key("j/k ↑/↓", "move selection"),
+            key("gg / G", "jump to top / bottom"),
+            key("/", "search titles & tags (incremental)"),
             key("tab", "cycle active → dormant → done"),
             key("enter/→", "expand subtasks & notes"),
             Line::from(""),
@@ -1189,6 +1255,73 @@ mod tests {
         // byte_at is char-aware.
         assert_eq!(byte_at("aé", 1), 1);
         assert_eq!(byte_at("aé", 2), 3);
+    }
+
+    // Stagger last_updated so ties don't leave the sort order ambiguous.
+    fn stagger(app: &mut App) {
+        let now = model::now();
+        let n = app.tasks.len() as u64;
+        for (i, t) in app.tasks.iter_mut().enumerate() {
+            t.last_updated = now - (n - i as u64); // t0 oldest → bottom
+        }
+    }
+
+    #[test]
+    fn selection_follows_task_it_acted_on() {
+        let mut app = app_with(3);
+        stagger(&mut app); // t2 newest at top, t0 oldest at bottom
+        let id = app.tasks[0].id; // the bottom task
+
+        // Editing touches it → floats to the top; selection must follow.
+        app.apply_edit(id, "edited".into());
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_task().map(|ti| app.tasks[ti].id), Some(id));
+
+        // Same for adding a subtask to a task that isn't currently selected.
+        app.selected = app.rows().len() - 1; // move away, to the bottom
+        let other = app.tasks.iter().find(|t| t.id != id).unwrap().id;
+        app.add_subtask(other, "sub".into());
+        assert_eq!(app.selected_task().map(|ti| app.tasks[ti].id), Some(other));
+    }
+
+    #[test]
+    fn find_match_hits_title_and_tags_case_insensitively() {
+        let mut app = app_with(0);
+        app.tasks.push(Task::new(1, "Buy Milk"));
+        app.tasks.push(Task::new(2, "walk dog"));
+        let mut tagged = Task::new(3, "call mom");
+        tagged.add_tag("Urgent");
+        app.tasks.push(tagged);
+        stagger(&mut app);
+
+        let i = app.find_match("DOG").expect("title match");
+        assert!(matches!(app.rows()[i], Row::Task(ti) if app.tasks[ti].id == 2));
+        let i = app.find_match("urgent").expect("tag match");
+        assert!(matches!(app.rows()[i], Row::Task(ti) if app.tasks[ti].id == 3));
+        assert!(app.find_match("zzz").is_none());
+        assert!(app.find_match("   ").is_none());
+    }
+
+    #[test]
+    fn gg_and_capital_g_jump_to_top_and_bottom() {
+        let mut app = app_with(4);
+        stagger(&mut app);
+        let bottom = app.rows().len() - 1;
+        app.selected = 1;
+
+        app.on_normal_key(KeyCode::Char('G'));
+        assert_eq!(app.selected, bottom);
+
+        app.on_normal_key(KeyCode::Char('g')); // arms
+        assert!(app.g_pending);
+        app.on_normal_key(KeyCode::Char('g')); // fires → top
+        assert_eq!(app.selected, 0);
+        assert!(!app.g_pending);
+
+        // A lone `g` then any other key cancels the pending gg.
+        app.on_normal_key(KeyCode::Char('g'));
+        app.on_normal_key(KeyCode::Char('j'));
+        assert!(!app.g_pending);
     }
 
     #[test]

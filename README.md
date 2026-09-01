@@ -91,6 +91,8 @@ Run `zym` with no arguments to launch the interactive interface.
 | Key | Action |
 |-----|--------|
 | `j` / `k` / `↑` / `↓` | move selection |
+| `gg` / `G` | jump to the top / bottom of the list |
+| `/` | search titles + tags (incremental; highlight follows the first match) |
 | `a` | add a task |
 | `s` | add a subtask to the current task |
 | `n` | add a note to the current task |
