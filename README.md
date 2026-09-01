@@ -104,7 +104,19 @@ Run `zym` with no arguments to launch the interactive interface.
 | `c` | open the config screen |
 | `q` / `Esc` | quit |
 
-While typing (add / subtask / note / edit): `Enter` confirms, `Esc` cancels.
+While typing (add / subtask / note / edit), the cursor is visible and the line
+scrolls to keep it on screen:
+
+| Key | Action |
+|-----|--------|
+| `Enter` | confirm |
+| `Esc` | cancel |
+| `←` / `→` | move the cursor |
+| `Ctrl+a` / `Home` | jump to line start |
+| `Ctrl+e` / `End` | jump to line end |
+| `Ctrl+u` | delete from the cursor back to the line start |
+| `Backspace` | delete the char before the cursor |
+| `Del` | delete the char at the cursor |
 
 ### Config screen (`c`)
 

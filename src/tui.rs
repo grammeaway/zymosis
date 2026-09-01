@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -142,6 +142,7 @@ struct App {
     selected: usize,
     mode: Mode,
     input: String,
+    cursor: usize, // char index into `input`
     status: Option<String>,
     view: View,
     expanded: HashSet<u64>,
@@ -160,6 +161,7 @@ impl App {
             selected: 0,
             mode: Mode::Normal,
             input: String::new(),
+            cursor: 0,
             status: None,
             view: View::Active,
             expanded: HashSet::new(),
@@ -258,7 +260,7 @@ impl App {
                             Mode::Normal => self.on_normal_key(k.code),
                             Mode::Help => self.mode = Mode::Normal, // any key closes help
                             Mode::Config => self.on_config_key(k.code),
-                            _ => self.on_input_key(k.code),
+                            _ => self.on_input_key(k.code, k.modifiers),
                         }
                         dirty = true;
                     }
@@ -290,30 +292,30 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Right => self.toggle_expand(),
             KeyCode::Char('a') => {
-                self.input.clear();
+                self.clear_input();
                 self.mode = Mode::Add;
             }
             KeyCode::Char('s') => {
                 if let Some(ti) = self.row_task() {
-                    self.input.clear();
+                    self.clear_input();
                     self.mode = Mode::AddSub(self.tasks[ti].id);
                 }
             }
             KeyCode::Char('n') => {
                 if let Some(ti) = self.row_task() {
-                    self.input.clear();
+                    self.clear_input();
                     self.mode = Mode::AddNote(self.tasks[ti].id);
                 }
             }
             KeyCode::Char('e') => {
                 if let Some(i) = self.selected_task() {
-                    self.input = self.tasks[i].title.clone();
+                    self.set_input(self.tasks[i].title.clone());
                     self.mode = Mode::Edit(self.tasks[i].id);
                 }
             }
             KeyCode::Char('t') => {
                 if let Some(i) = self.selected_task() {
-                    self.input = self.tasks[i].tags.join(" ");
+                    self.set_input(self.tasks[i].tags.join(" "));
                     self.mode = Mode::EditTags(self.tasks[i].id);
                 }
             }
@@ -354,14 +356,16 @@ impl App {
             }
             KeyCode::Enter => {
                 let f = CFG_FIELDS[self.cfg_sel].0;
-                self.input = cfg_value(&self.cfg, f);
+                self.set_input(cfg_value(&self.cfg, f));
                 self.mode = Mode::EditCfg(f);
             }
             _ => {}
         }
     }
 
-    fn on_input_key(&mut self, code: KeyCode) {
+    fn on_input_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        let len = self.input.chars().count();
         match code {
             KeyCode::Esc => {
                 self.mode = if matches!(self.mode, Mode::EditCfg(_)) {
@@ -369,12 +373,34 @@ impl App {
                 } else {
                     Mode::Normal
                 };
-                self.input.clear();
+                self.clear_input();
             }
-            KeyCode::Backspace => {
-                self.input.pop();
+            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Right => self.cursor = (self.cursor + 1).min(len),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = len,
+            KeyCode::Char('a') if ctrl => self.cursor = 0,
+            KeyCode::Char('e') if ctrl => self.cursor = len,
+            KeyCode::Char('u') if ctrl => {
+                // Kill from cursor back to the start of the line (readline Ctrl+U).
+                let b = byte_at(&self.input, self.cursor);
+                self.input.replace_range(..b, "");
+                self.cursor = 0;
             }
-            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Backspace if self.cursor > 0 => {
+                let b = byte_at(&self.input, self.cursor - 1);
+                self.input.remove(b);
+                self.cursor -= 1;
+            }
+            KeyCode::Delete if self.cursor < len => {
+                let b = byte_at(&self.input, self.cursor);
+                self.input.remove(b);
+            }
+            KeyCode::Char(c) if !ctrl => {
+                let b = byte_at(&self.input, self.cursor);
+                self.input.insert(b, c);
+                self.cursor += 1;
+            }
             // Config edits parse/validate and stay on the config screen; a bad
             // value shows an error and keeps the input for a retry.
             KeyCode::Enter if matches!(self.mode, Mode::EditCfg(_)) => {
@@ -387,7 +413,7 @@ impl App {
                         self.theme = Theme::named(&self.cfg.theme); // live theme switch
                         self.save_cfg();
                         self.mode = Mode::Config;
-                        self.input.clear();
+                        self.clear_input();
                     }
                     Err(e) => self.status = Some(e),
                 }
@@ -405,15 +431,29 @@ impl App {
                         Mode::Edit(id) => self.apply_edit(id, title),
                         Mode::AddSub(id) => self.add_subtask(id, title),
                         Mode::AddNote(id) => self.add_note(id, title),
-                        Mode::Normal | Mode::Help | Mode::Config | Mode::EditCfg(_) | Mode::EditTags(_) => {}
+                        Mode::Normal
+                        | Mode::Help
+                        | Mode::Config
+                        | Mode::EditCfg(_)
+                        | Mode::EditTags(_) => {}
                     }
                     self.persist();
                 }
                 self.mode = Mode::Normal;
-                self.input.clear();
+                self.clear_input();
             }
             _ => {}
         }
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+    }
+
+    fn set_input(&mut self, s: String) {
+        self.cursor = s.chars().count();
+        self.input = s;
     }
 
     // --- pure mutations (no I/O; caller persists) ---
@@ -686,18 +726,30 @@ impl App {
         }
 
         let hot = self.theme.hot;
-        // Tail long inputs so the cursor end stays on screen (footer is one line).
         let w = footer.width as usize;
-        let prompt = |label: &str, s: &str| Line::from(tail(&format!("{label}> {s}"), w).fg(hot));
+        // Label for whichever mode is taking text input (None = not editing).
+        let input_label = match self.mode {
+            Mode::Add => Some("add"),
+            Mode::AddSub(_) => Some("subtask"),
+            Mode::AddNote(_) => Some("note"),
+            Mode::Edit(_) => Some("edit"),
+            Mode::EditTags(_) => Some("tags"),
+            Mode::EditCfg(f) if self.status.is_none() => Some(CFG_FIELDS[cfg_field_index(f)].1),
+            _ => None,
+        };
+        if let Some(label) = input_label {
+            // Scroll horizontally so the cursor stays visible, then place the
+            // real terminal cursor at its column.
+            let prefix = format!("{label}> ");
+            let (vis, col) = input_window(&prefix, &self.input, self.cursor, w);
+            f.render_widget(Paragraph::new(Line::from(vis.fg(hot))), footer);
+            f.set_cursor_position((footer.x + col as u16, footer.y));
+            return;
+        }
         let footer_line = match self.mode {
-            Mode::Add => prompt("add", &self.input),
-            Mode::AddSub(_) => prompt("subtask", &self.input),
-            Mode::AddNote(_) => prompt("note", &self.input),
-            Mode::Edit(_) => prompt("edit", &self.input),
-            Mode::EditTags(_) => prompt("tags", &self.input),
-            Mode::EditCfg(f) => match &self.status {
+            Mode::EditCfg(_) => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
-                None => prompt(CFG_FIELDS[cfg_field_index(f)].1, &self.input),
+                None => unreachable!("handled by input_label branch"),
             },
             Mode::Config => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
@@ -710,12 +762,15 @@ impl App {
                     "? help · a add · e edit · y yank · space done · tab view · q quit".dim(),
                 ),
             },
+            // Text-input modes returned early above with the cursor drawn.
+            _ => unreachable!("input modes handled by input_label branch"),
         };
         f.render_widget(Paragraph::new(footer_line), footer);
     }
 
     fn draw_help(&self, f: &mut Frame, body: ratatui::layout::Rect) {
-        let head = |s: &'static str| Line::from(s.fg(self.theme.accent).add_modifier(Modifier::BOLD));
+        let head =
+            |s: &'static str| Line::from(s.fg(self.theme.accent).add_modifier(Modifier::BOLD));
         let key = |k: &'static str, desc: &'static str| {
             Line::from(vec![
                 Span::styled(format!("  {k:10}"), Style::default().fg(self.theme.tag)),
@@ -740,6 +795,13 @@ impl App {
             key("s", "add subtask"),
             key("n", "add note"),
             key("space", "toggle subtask done"),
+            Line::from(""),
+            head("editing"),
+            key("←/→", "move cursor"),
+            key("^a/^e", "cursor to start / end"),
+            key("home/end", "cursor to start / end"),
+            key("^u", "delete to line start"),
+            key("del", "delete char at cursor"),
             Line::from(""),
             head("other"),
             key("y", "yank selected to clipboard"),
@@ -786,6 +848,23 @@ fn tail(s: &str, width: usize) -> String {
     s.chars().skip(n - width).collect()
 }
 
+/// Byte offset of char index `i` (or the string's end when `i` is past it).
+fn byte_at(s: &str, i: usize) -> usize {
+    s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Window a `prefix + input` line to `width` columns, scrolling horizontally so
+/// the cursor stays visible. Returns the visible slice and the cursor's column
+/// within it. `cursor` is a char index into `input`.
+fn input_window(prefix: &str, input: &str, cursor: usize, width: usize) -> (String, usize) {
+    let width = width.max(1);
+    let full: Vec<char> = prefix.chars().chain(input.chars()).collect();
+    let cur = prefix.chars().count() + cursor.min(input.chars().count());
+    let start = cur.saturating_sub(width - 1);
+    let vis: String = full.iter().skip(start).take(width).collect();
+    (vis, cur - start)
+}
+
 /// Copy `text` to the system clipboard via the OSC 52 terminal escape. Portable
 /// (works over SSH, no X/Wayland/pbcopy fork) and dependency-free.
 // ponytail: OSC 52 needs terminal support (kitty/iterm2/wezterm/tmux, etc.);
@@ -807,8 +886,16 @@ fn base64(data: &[u8]) -> String {
             | *c.get(2).unwrap_or(&0) as u32;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if c.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -1088,9 +1175,29 @@ mod tests {
     }
 
     #[test]
+    fn input_window_scrolls_to_keep_cursor_visible() {
+        // Fits: whole line shown, cursor where it sits.
+        assert_eq!(input_window("add> ", "hi", 2, 20), ("add> hi".into(), 7));
+        // Cursor at the start of a long input: window anchored at the start.
+        let (vis, col) = input_window("e> ", "0123456789", 0, 6);
+        assert_eq!((vis.as_str(), col), ("e> 012", 3));
+        // Cursor at the end: window scrolls right, cursor on the last column.
+        let (vis, col) = input_window("e> ", "0123456789", 10, 6);
+        // Cursor sits one past the last char, so width-1 chars are shown.
+        assert_eq!(col, 5);
+        assert!(vis.ends_with('9') && vis.chars().count() == 5);
+        // byte_at is char-aware.
+        assert_eq!(byte_at("aé", 1), 1);
+        assert_eq!(byte_at("aé", 2), 3);
+    }
+
+    #[test]
     fn yank_sets_status_for_each_row_kind() {
         let mut app = app_with(1);
-        app.tasks[0].subtasks = vec![SubTask { title: "sub".into(), done: false }];
+        app.tasks[0].subtasks = vec![SubTask {
+            title: "sub".into(),
+            done: false,
+        }];
         app.add_note(app.tasks[0].id, "a note".into()); // auto-expands
         app.selected = 0;
         app.yank_selected();
