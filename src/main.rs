@@ -9,8 +9,8 @@ use clap::Parser;
 fn main() {
     let args = cli::Cli::parse();
     match args.command {
-        Some(cmd) => {
-            if let Err(e) = cli::run(cmd) {
+        Some(_) => {
+            if let Err(e) = cli::run(args) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }

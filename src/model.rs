@@ -83,6 +83,33 @@ pub fn normalize_tag(s: &str) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
+/// Normalize + validate a board name. Lenient: just trimmed, preserving case,
+/// spaces, and unicode. The only rejections keep it usable as a filename and a
+/// TOML key: non-empty, not `.`/`..`, no path separators or control chars, and
+/// a sane length.
+pub fn normalize_board_name(s: &str) -> Result<String, String> {
+    let name = s.trim();
+    if name.is_empty() {
+        return Err("board name is empty".into());
+    }
+    if name == "." || name == ".." {
+        return Err("board name cannot be '.' or '..'".into());
+    }
+    if name.len() > 128 {
+        return Err("board name is too long (max 128 bytes)".into());
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|&c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err(format!(
+            "board name cannot contain '{}'",
+            c.escape_default()
+        ));
+    }
+    Ok(name.to_string())
+}
+
 impl Task {
     pub fn new(id: u64, title: impl Into<String>) -> Self {
         let ts = now();
@@ -212,6 +239,20 @@ mod tests {
         assert!(t.has_tag("MONITORING"));
         assert!(t.remove_tag("monitoring"));
         assert!(t.tags.is_empty());
+    }
+
+    #[test]
+    fn board_names_trim_and_reject_only_unsafe() {
+        assert_eq!(
+            normalize_board_name("  Hello world ").unwrap(),
+            "Hello world"
+        );
+        assert_eq!(normalize_board_name("my-board_2").unwrap(), "my-board_2");
+        assert_eq!(normalize_board_name("a.b").unwrap(), "a.b"); // dots ok
+        assert_eq!(normalize_board_name("æøå").unwrap(), "æøå"); // unicode ok
+        for bad in ["", "   ", "a/b", "a\\b", ".", "..", "x\ty"] {
+            assert!(normalize_board_name(bad).is_err(), "{bad:?} should reject");
+        }
     }
 
     #[test]

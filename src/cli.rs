@@ -15,6 +15,9 @@ use crate::store;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+    /// Act on this board for this invocation (overrides the active board).
+    #[arg(short = 'b', long, global = true)]
+    pub board: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -69,6 +72,11 @@ pub enum Command {
     },
     /// Show a task with its (indexed) subtasks.
     Show { id: u64 },
+    /// Manage boards (independent task lists).
+    Board {
+        #[command(subcommand)]
+        action: BoardCmd,
+    },
     /// Print the version (also available as --version / -V).
     Version,
     /// Work with a task's subtasks (index is 1-based).
@@ -86,6 +94,21 @@ pub enum Command {
         #[command(subcommand)]
         action: TagCmd,
     },
+}
+
+#[derive(Subcommand)]
+pub enum BoardCmd {
+    /// List boards (active one marked with *).
+    List,
+    /// Create an empty board.
+    Add { name: String },
+    /// Switch the active board (persisted to config).
+    Use { name: String },
+    /// Rename a board (moves its file + any config overrides).
+    Rename { old: String, new: String },
+    /// Delete a board's file (not the active or last board).
+    #[command(visible_alias = "delete")]
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -216,13 +239,98 @@ fn io_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-pub fn run(cmd: Command) -> Result<(), String> {
+/// The board a task command acts on: `-b` flag beats the config's active board.
+/// Both go through `normalize_board_name` so a typo fails rather than targeting
+/// a phantom board.
+fn resolve_board(flag: Option<&str>, active: &str) -> Result<String, String> {
+    model::normalize_board_name(flag.unwrap_or(active))
+}
+
+fn run_board(action: BoardCmd, cfg: &mut Config) -> Result<(), String> {
+    match action {
+        BoardCmd::List => {
+            let mut names = store::list_boards(&cfg.storage_path).map_err(io_err)?;
+            if !names.contains(&cfg.active_board) {
+                names.push(cfg.active_board.clone());
+                names.sort();
+            }
+            for name in names {
+                let mark = if name == cfg.active_board { "*" } else { " " };
+                println!("{mark} {name}");
+            }
+        }
+        BoardCmd::Add { name } => {
+            let name = model::normalize_board_name(&name)?;
+            let path = store::board_path(&cfg.storage_path, &name);
+            if path.exists() {
+                return Err(format!("board '{name}' already exists"));
+            }
+            store::save(&path, &[]).map_err(io_err)?;
+            println!("created board '{name}'");
+        }
+        BoardCmd::Use { name } => {
+            let name = model::normalize_board_name(&name)?;
+            if !store::board_path(&cfg.storage_path, &name).exists() {
+                return Err(format!(
+                    "no board '{name}' — create it with `zym board add`"
+                ));
+            }
+            cfg.active_board = name.clone();
+            config::save(cfg).map_err(io_err)?;
+            println!("switched to board '{name}'");
+        }
+        BoardCmd::Rename { old, new } => {
+            let old = model::normalize_board_name(&old)?;
+            let new = model::normalize_board_name(&new)?;
+            let from = store::board_path(&cfg.storage_path, &old);
+            let to = store::board_path(&cfg.storage_path, &new);
+            if !from.exists() {
+                return Err(format!("no board '{old}'"));
+            }
+            if old != new && to.exists() {
+                return Err(format!("board '{new}' already exists"));
+            }
+            std::fs::rename(&from, &to).map_err(io_err)?;
+            if let Some(o) = cfg.boards.remove(&old) {
+                cfg.boards.insert(new.clone(), o);
+            }
+            if cfg.active_board == old {
+                cfg.active_board = new.clone();
+            }
+            config::save(cfg).map_err(io_err)?;
+            println!("renamed board '{old}' to '{new}'");
+        }
+        BoardCmd::Rm { name } => {
+            let name = model::normalize_board_name(&name)?;
+            if name == cfg.active_board {
+                return Err(format!("cannot remove the active board '{name}'"));
+            }
+            let boards = store::list_boards(&cfg.storage_path).map_err(io_err)?;
+            if boards.len() <= 1 {
+                return Err("cannot remove the only board".into());
+            }
+            let path = store::board_path(&cfg.storage_path, &name);
+            if !path.exists() {
+                return Err(format!("no board '{name}'"));
+            }
+            std::fs::remove_file(&path).map_err(io_err)?;
+            if cfg.boards.remove(&name).is_some() {
+                config::save(cfg).map_err(io_err)?;
+            }
+            println!("removed board '{name}'");
+        }
+    }
+    Ok(())
+}
+
+pub fn run(cli: Cli) -> Result<(), String> {
+    let cmd = cli.command.expect("run called without a subcommand");
     if let Command::Version = cmd {
         println!("zym {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
-    let cfg = config::load()?;
+    let mut cfg = config::load()?;
 
     // Config command doesn't touch the store.
     if let Command::Config { json, init } = cmd {
@@ -234,13 +342,23 @@ pub fn run(cmd: Command) -> Result<(), String> {
         } else {
             println!("config_path  = {}", config::config_path().display());
             println!("storage_path = {}", cfg.storage_path.display());
+            println!("active_board = {}", cfg.active_board);
             println!("---");
             print!("{}", toml::to_string(&cfg).map_err(io_err)?);
         }
         return Ok(());
     }
 
-    let mut tasks = store::load(&cfg.storage_path).map_err(io_err)?;
+    // Board management needs cfg but not the task list.
+    if let Command::Board { action } = cmd {
+        return run_board(action, &mut cfg);
+    }
+
+    let board = resolve_board(cli.board.as_deref(), &cfg.active_board)?;
+    let ecfg = cfg.effective(&board);
+    store::migrate_legacy(&cfg.storage_path).map_err(io_err)?;
+    let store_path = store::board_path(&cfg.storage_path, &board);
+    let mut tasks = store::load(&store_path).map_err(io_err)?;
     let now = model::now();
 
     match cmd {
@@ -263,7 +381,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
             }
             let id = task.id;
             tasks.push(task);
-            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            store::save(&store_path, &tasks).map_err(io_err)?;
             println!("added task {id}");
         }
         Command::List {
@@ -272,13 +390,13 @@ pub fn run(cmd: Command) -> Result<(), String> {
             all,
             json,
         } => {
-            let view = select(&tasks, &cfg, status, tag.as_deref(), all, now);
+            let view = select(&tasks, &ecfg, status, tag.as_deref(), all, now);
             if json {
                 let out: Vec<TaskView> = view
                     .iter()
                     .map(|t| TaskView {
                         task: t,
-                        status: status_str(status_of(t, &cfg, now)),
+                        status: status_str(status_of(t, &ecfg, now)),
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&out).map_err(io_err)?);
@@ -298,7 +416,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
                         "{:>4} [{}] {:8} {}{}{}",
                         t.id,
                         mark,
-                        status_str(status_of(t, &cfg, now)),
+                        status_str(status_of(t, &ecfg, now)),
                         t.title,
                         prog,
                         tags
@@ -308,7 +426,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
         }
         Command::Done { id } => {
             find_mut(&mut tasks, id)?.done = true;
-            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            store::save(&store_path, &tasks).map_err(io_err)?;
             println!("marked task {id} done");
         }
         Command::Edit { id, title } => {
@@ -317,12 +435,12 @@ pub fn run(cmd: Command) -> Result<(), String> {
                 t.title = title;
             }
             t.touch();
-            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            store::save(&store_path, &tasks).map_err(io_err)?;
             println!("edited task {id}");
         }
         Command::Revive { id } => {
             find_mut(&mut tasks, id)?.touch();
-            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            store::save(&store_path, &tasks).map_err(io_err)?;
             println!("revived task {id}");
         }
         Command::Rm { id } => {
@@ -331,7 +449,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
             if tasks.len() == before {
                 return Err(format!("no task with id {id}"));
             }
-            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            store::save(&store_path, &tasks).map_err(io_err)?;
             println!("removed task {id}");
         }
         Command::Export { path } => {
@@ -347,7 +465,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
             }
             let n = incoming.len();
             tasks.extend(incoming);
-            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            store::save(&store_path, &tasks).map_err(io_err)?;
             println!("imported {n} task(s)");
         }
         Command::Show { id } => {
@@ -357,7 +475,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
                 .ok_or_else(|| format!("no task with id {id}"))?;
             let mark = if t.done { "x" } else { " " };
             println!("#{} [{}] {}", t.id, mark, t.title);
-            println!("status: {}", status_str(status_of(t, &cfg, now)));
+            println!("status: {}", status_str(status_of(t, &ecfg, now)));
             if !t.tags.is_empty() {
                 println!("tags:  {}", tag_suffix(t).trim());
             }
@@ -399,7 +517,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
                     format!("removed subtask {index} from task {task_id}")
                 }
             };
-            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            store::save(&store_path, &tasks).map_err(io_err)?;
             println!("{msg}");
         }
         Command::Tag { action } => {
@@ -421,7 +539,7 @@ pub fn run(cmd: Command) -> Result<(), String> {
                     format!("untagged task {task_id}")
                 }
             };
-            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            store::save(&store_path, &tasks).map_err(io_err)?;
             println!("{msg}");
         }
         Command::Note { action } => {
@@ -442,10 +560,12 @@ pub fn run(cmd: Command) -> Result<(), String> {
                     format!("removed note {index} from task {task_id}")
                 }
             };
-            store::save(&cfg.storage_path, &tasks).map_err(io_err)?;
+            store::save(&store_path, &tasks).map_err(io_err)?;
             println!("{msg}");
         }
-        Command::Config { .. } | Command::Version => unreachable!("handled above"),
+        Command::Config { .. } | Command::Board { .. } | Command::Version => {
+            unreachable!("handled above")
+        }
     }
     Ok(())
 }
@@ -468,6 +588,13 @@ mod tests {
         t.done = done;
         t.last_updated = NOW - secs_ago;
         t
+    }
+
+    #[test]
+    fn resolve_board_flag_beats_config_and_trims() {
+        assert_eq!(resolve_board(Some("  Work "), "default").unwrap(), "Work");
+        assert_eq!(resolve_board(None, "work").unwrap(), "work");
+        assert!(resolve_board(Some("a/b"), "default").is_err());
     }
 
     #[test]

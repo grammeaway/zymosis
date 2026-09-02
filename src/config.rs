@@ -6,6 +6,7 @@
 //! the default, so old config files keep working. Durations are written as human
 //! spans ("2d", "36h") rather than opaque seconds.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::model::Thresholds;
+use crate::model::{Thresholds, normalize_board_name};
 
 /// A duration written as `<n><unit>`, unit one of s/m/h/d/w. Single unit only.
 // ponytail: single-unit spans only ("2d", not "1d12h"); add multi-unit parsing
@@ -91,6 +92,34 @@ pub struct Config {
     /// default). Kept a free string so old files load and new themes need no
     /// schema change.
     pub theme: String,
+    /// The board the CLI/TUI act on when no `-b` flag is given.
+    pub active_board: String,
+    /// Per-board overrides, serialized as `[boards.<name>]` tables. Kept last so
+    /// the scalar fields serialize before it (TOML requires tables come after).
+    pub boards: BTreeMap<String, BoardOverrides>,
+}
+
+/// Optional per-board overrides; every `None` field inherits the global config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BoardOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_window: Option<Span>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dormant_after: Option<Span>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bubble_after: Option<Span>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+}
+
+impl BoardOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.hot_window.is_none()
+            && self.dormant_after.is_none()
+            && self.bubble_after.is_none()
+            && self.theme.is_none()
+    }
 }
 
 impl Default for Config {
@@ -102,6 +131,8 @@ impl Default for Config {
             storage_path: default_storage_path(),
             tick_fps: 12,
             theme: "neon_purple".into(),
+            active_board: "default".into(),
+            boards: BTreeMap::new(),
         }
     }
 }
@@ -115,7 +146,29 @@ impl Config {
         }
     }
 
-    /// Enforce the ordering the lifecycle math assumes for monotonic behaviour.
+    /// A copy of this config with `board`'s overrides applied. Unknown board
+    /// (or no overrides) yields an unchanged clone.
+    pub fn effective(&self, board: &str) -> Config {
+        let mut cfg = self.clone();
+        if let Some(o) = self.boards.get(board) {
+            if let Some(v) = o.hot_window {
+                cfg.hot_window = v;
+            }
+            if let Some(v) = o.dormant_after {
+                cfg.dormant_after = v;
+            }
+            if let Some(v) = o.bubble_after {
+                cfg.bubble_after = v;
+            }
+            if let Some(v) = &o.theme {
+                cfg.theme = v.clone();
+            }
+        }
+        cfg
+    }
+
+    /// Enforce the ordering the lifecycle math assumes for monotonic behaviour,
+    /// globally and for every board's effective thresholds.
     pub fn validate(&self) -> Result<(), String> {
         if self.hot_window.0 > self.dormant_after.0 {
             return Err(format!(
@@ -126,6 +179,17 @@ impl Config {
         }
         if self.tick_fps == 0 {
             return Err("tick_fps must be >= 1".into());
+        }
+        for name in self.boards.keys() {
+            normalize_board_name(name)?;
+            let e = self.effective(name);
+            if e.hot_window.0 > e.dormant_after.0 {
+                return Err(format!(
+                    "board '{name}': hot_window ({}) must be <= dormant_after ({})",
+                    format_span(e.hot_window.0),
+                    format_span(e.dormant_after.0),
+                ));
+            }
         }
         Ok(())
     }
@@ -227,5 +291,78 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "hot_window = \"20d\"\ndormant_after = \"14d\"\n").unwrap();
         assert!(load_from(&path).is_err());
+    }
+
+    #[test]
+    fn old_file_defaults_active_board_and_empty_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "hot_window = \"1d\"\n").unwrap();
+        let cfg = load_from(&path).unwrap();
+        assert_eq!(cfg.active_board, "default");
+        assert!(cfg.boards.is_empty());
+    }
+
+    #[test]
+    fn board_override_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[boards.work]\nhot_window = \"1d\"\n").unwrap();
+        let cfg = load_from(&path).unwrap();
+        assert_eq!(
+            cfg.boards["work"].hot_window,
+            Some(Span(Duration::from_secs(86_400)))
+        );
+        save_to(&cfg, &path).unwrap();
+        assert_eq!(load_from(&path).unwrap(), cfg);
+    }
+
+    #[test]
+    fn effective_overrides_win_and_others_inherit() {
+        let mut cfg = Config::default();
+        cfg.boards.insert(
+            "work".into(),
+            BoardOverrides {
+                hot_window: Some(Span(Duration::from_secs(3600))),
+                ..Default::default()
+            },
+        );
+        let e = cfg.effective("work");
+        assert_eq!(e.hot_window, Span(Duration::from_secs(3600)));
+        assert_eq!(e.dormant_after, cfg.dormant_after); // inherited
+        assert_eq!(cfg.effective("nonexistent"), cfg); // no overrides
+    }
+
+    #[test]
+    fn validation_rejects_board_that_breaks_ordering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // global dormant_after is 14d; a 20d hot_window override breaks ordering.
+        fs::write(&path, "[boards.work]\nhot_window = \"20d\"\n").unwrap();
+        assert!(load_from(&path).is_err());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn effective_field_is_override_or_global(
+            hw in proptest::option::of(1u64..1000),
+            da in proptest::option::of(1u64..1000),
+            ba in proptest::option::of(0u64..1000),
+            th in proptest::option::of("[a-z]{1,6}"),
+        ) {
+            let mut cfg = Config::default();
+            let o = BoardOverrides {
+                hot_window: hw.map(|s| Span(Duration::from_secs(s))),
+                dormant_after: da.map(|s| Span(Duration::from_secs(s))),
+                bubble_after: ba.map(|s| Span(Duration::from_secs(s))),
+                theme: th.clone(),
+            };
+            cfg.boards.insert("b".into(), o.clone());
+            let e = cfg.effective("b");
+            proptest::prop_assert_eq!(e.hot_window, o.hot_window.unwrap_or(cfg.hot_window));
+            proptest::prop_assert_eq!(e.dormant_after, o.dormant_after.unwrap_or(cfg.dormant_after));
+            proptest::prop_assert_eq!(e.bubble_after, o.bubble_after.unwrap_or(cfg.bubble_after));
+            proptest::prop_assert_eq!(e.theme, o.theme.unwrap_or(cfg.theme));
+        }
     }
 }

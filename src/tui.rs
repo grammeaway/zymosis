@@ -13,19 +13,21 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::config::{self, Config, Span as CfgSpan};
+use crate::config::{self, BoardOverrides, Config, Span as CfgSpan};
 use crate::model::{self, Status, SubTask, Task, Thresholds};
 use crate::store;
 
 pub fn run() -> Result<(), String> {
     let cfg = config::load()?;
-    let tasks = store::load(&cfg.storage_path).map_err(|e| e.to_string())?;
+    store::migrate_legacy(&cfg.storage_path).map_err(|e| e.to_string())?;
+    let path = store::board_path(&cfg.storage_path, &cfg.active_board);
+    let tasks = store::load(&path).map_err(|e| e.to_string())?;
     let mut app = App::new(cfg, tasks);
     let mut term = ratatui::try_init().map_err(|e| format!("no terminal available: {e}"))?;
     let res = app.run(&mut term);
@@ -46,6 +48,18 @@ enum Mode {
     Search,
     Config,
     EditCfg(CfgField),
+    Boards { names: Vec<String>, sel: usize },
+    AddBoard,
+    RenameBoard { old: String },
+    ConfirmDeleteBoard { name: String },
+}
+
+/// Which config layer an edit targets: the global config, or the current
+/// board's overrides.
+#[derive(Clone, Copy, PartialEq)]
+enum Scope {
+    Global,
+    Board,
 }
 
 /// The three task sections. Dormant and Done are fully separate views, not a
@@ -100,33 +114,108 @@ fn cfg_value(cfg: &Config, f: CfgField) -> String {
     }
 }
 
-/// Apply one field edit to a copy of the config, parsing + validating. Pure so
-/// the parse/validate branch is testable without a terminal.
-fn apply_cfg(cfg: &Config, f: CfgField, input: &str) -> Result<Config, String> {
+fn parse_theme(input: &str) -> Result<String, String> {
+    let name = input.trim();
+    if THEME_NAMES.contains(&name) {
+        Ok(name.to_string())
+    } else {
+        Err(format!(
+            "unknown theme '{name}' (try: {})",
+            THEME_NAMES.join(", ")
+        ))
+    }
+}
+
+/// Apply one field edit to a copy of the config, parsing + validating. Global
+/// scope edits the shared config; board scope edits `board`'s overrides, where
+/// empty input clears the override (and drops the entry once it's empty).
+/// tick_fps is global-only. Pure so the parse/validate branch is testable.
+fn apply_cfg(
+    cfg: &Config,
+    board: &str,
+    scope: Scope,
+    f: CfgField,
+    input: &str,
+) -> Result<Config, String> {
     let mut next = cfg.clone();
-    match f {
-        CfgField::HotWindow => next.hot_window = CfgSpan::parse(input)?,
-        CfgField::DormantAfter => next.dormant_after = CfgSpan::parse(input)?,
-        CfgField::BubbleAfter => next.bubble_after = CfgSpan::parse(input)?,
-        CfgField::TickFps => {
-            next.tick_fps = input
-                .trim()
-                .parse()
-                .map_err(|_| format!("bad number '{}'", input.trim()))?
-        }
-        CfgField::Theme => {
-            let name = input.trim();
-            if !THEME_NAMES.contains(&name) {
-                return Err(format!(
-                    "unknown theme '{name}' (try: {})",
-                    THEME_NAMES.join(", ")
-                ));
+    match scope {
+        Scope::Global => match f {
+            CfgField::HotWindow => next.hot_window = CfgSpan::parse(input)?,
+            CfgField::DormantAfter => next.dormant_after = CfgSpan::parse(input)?,
+            CfgField::BubbleAfter => next.bubble_after = CfgSpan::parse(input)?,
+            CfgField::TickFps => {
+                next.tick_fps = input
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("bad number '{}'", input.trim()))?
             }
-            next.theme = name.to_string();
+            CfgField::Theme => next.theme = parse_theme(input)?,
+        },
+        Scope::Board => {
+            if matches!(f, CfgField::TickFps) {
+                return Err("tick_fps is global-only".into());
+            }
+            let empty = input.trim().is_empty();
+            let entry = next.boards.entry(board.to_string()).or_default();
+            match f {
+                CfgField::HotWindow => {
+                    entry.hot_window = if empty {
+                        None
+                    } else {
+                        Some(CfgSpan::parse(input)?)
+                    }
+                }
+                CfgField::DormantAfter => {
+                    entry.dormant_after = if empty {
+                        None
+                    } else {
+                        Some(CfgSpan::parse(input)?)
+                    }
+                }
+                CfgField::BubbleAfter => {
+                    entry.bubble_after = if empty {
+                        None
+                    } else {
+                        Some(CfgSpan::parse(input)?)
+                    }
+                }
+                CfgField::Theme => {
+                    entry.theme = if empty {
+                        None
+                    } else {
+                        Some(parse_theme(input)?)
+                    }
+                }
+                CfgField::TickFps => unreachable!("rejected above"),
+            }
+            if next.boards[board].is_empty() {
+                next.boards.remove(board);
+            }
         }
     }
     next.validate()?;
     Ok(next)
+}
+
+fn override_is_set(o: &BoardOverrides, f: CfgField) -> bool {
+    match f {
+        CfgField::HotWindow => o.hot_window.is_some(),
+        CfgField::DormantAfter => o.dormant_after.is_some(),
+        CfgField::BubbleAfter => o.bubble_after.is_some(),
+        CfgField::Theme => o.theme.is_some(),
+        CfgField::TickFps => false,
+    }
+}
+
+/// Raw string of an override field (for edit prefill); empty when unset.
+fn override_raw(o: &BoardOverrides, f: CfgField) -> String {
+    match f {
+        CfgField::HotWindow => o.hot_window.map(|s| s.as_human()).unwrap_or_default(),
+        CfgField::DormantAfter => o.dormant_after.map(|s| s.as_human()).unwrap_or_default(),
+        CfgField::BubbleAfter => o.bubble_after.map(|s| s.as_human()).unwrap_or_default(),
+        CfgField::Theme => o.theme.clone().unwrap_or_default(),
+        CfgField::TickFps => String::new(),
+    }
 }
 
 /// A rendered line: a task, one of its subtasks, or one of its notes (indices
@@ -140,6 +229,7 @@ enum Row {
 
 struct App {
     cfg: Config,
+    board: String,
     theme: Theme,
     tasks: Vec<Task>,
     selected: usize,
@@ -150,6 +240,7 @@ struct App {
     view: View,
     expanded: HashSet<u64>,
     cfg_sel: usize,
+    cfg_scope: Scope,
     g_pending: bool, // saw a lone `g`, waiting for the second in `gg`
     frame: u64,
     quit: bool,
@@ -157,9 +248,11 @@ struct App {
 
 impl App {
     fn new(cfg: Config, tasks: Vec<Task>) -> Self {
-        let theme = Theme::named(&cfg.theme);
+        let board = cfg.active_board.clone();
+        let theme = Theme::named(&cfg.effective(&board).theme);
         Self {
             cfg,
+            board,
             theme,
             tasks,
             selected: 0,
@@ -170,10 +263,17 @@ impl App {
             view: View::Active,
             expanded: HashSet::new(),
             cfg_sel: 0,
+            cfg_scope: Scope::Global,
             g_pending: false,
             frame: 0,
             quit: false,
         }
+    }
+
+    /// Config with the active board's overrides applied — the source of truth
+    /// for thresholds and theme.
+    fn ecfg(&self) -> Config {
+        self.cfg.effective(&self.board)
     }
 
     /// Task indices belonging to the current view, ordered by lifecycle
@@ -181,7 +281,7 @@ impl App {
     /// only in the Done view; Active and Dormant split the rest by status.
     fn visible(&self) -> Vec<usize> {
         let now = model::now();
-        let th = self.cfg.thresholds();
+        let th = self.ecfg().thresholds();
         let mut idx: Vec<usize> = (0..self.tasks.len())
             .filter(|&i| {
                 let t = &self.tasks[i];
@@ -240,7 +340,7 @@ impl App {
 
     fn has_animation(&self) -> bool {
         let now = model::now();
-        let th = self.cfg.thresholds();
+        let th = self.ecfg().thresholds();
         self.visible().iter().any(|&i| {
             matches!(
                 self.tasks[i].status(&th, now),
@@ -265,6 +365,10 @@ impl App {
                             Mode::Normal => self.on_normal_key(k.code),
                             Mode::Help => self.mode = Mode::Normal, // any key closes help
                             Mode::Config => self.on_config_key(k.code),
+                            Mode::Boards { .. } => self.on_boards_key(k.code),
+                            Mode::ConfirmDeleteBoard { .. } => {
+                                self.on_confirm_delete_board_key(k.code)
+                            }
                             _ => self.on_input_key(k.code, k.modifiers),
                         }
                         dirty = true;
@@ -359,8 +463,10 @@ impl App {
             }
             KeyCode::Char('c') => {
                 self.cfg_sel = 0;
+                self.cfg_scope = Scope::Global;
                 self.mode = Mode::Config;
             }
+            KeyCode::Char('b') => self.open_boards(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('y') => self.yank_selected(),
             KeyCode::Char('x') | KeyCode::Delete => {
@@ -376,6 +482,12 @@ impl App {
         self.status = None;
         match code {
             KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Tab => {
+                self.cfg_scope = match self.cfg_scope {
+                    Scope::Global => Scope::Board,
+                    Scope::Board => Scope::Global,
+                };
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.cfg_sel = move_selection(self.cfg_sel, CFG_FIELDS.len(), 1)
             }
@@ -384,11 +496,201 @@ impl App {
             }
             KeyCode::Enter => {
                 let f = CFG_FIELDS[self.cfg_sel].0;
-                self.set_input(cfg_value(&self.cfg, f));
-                self.mode = Mode::EditCfg(f);
+                if self.cfg_scope == Scope::Board && f == CfgField::TickFps {
+                    self.status = Some("tick_fps is global-only".into());
+                } else {
+                    self.set_input(self.cfg_edit_value(f));
+                    self.mode = Mode::EditCfg(f);
+                }
             }
             _ => {}
         }
+    }
+
+    /// Value to prefill the edit line: the global value, or the current override
+    /// (empty when unset, so board-scope editing starts blank and empty clears).
+    fn cfg_edit_value(&self, f: CfgField) -> String {
+        match self.cfg_scope {
+            Scope::Global => cfg_value(&self.cfg, f),
+            Scope::Board => self
+                .cfg
+                .boards
+                .get(&self.board)
+                .map(|o| override_raw(o, f))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Board names for the picker, always including the active board even if its
+    /// file doesn't exist on disk yet.
+    fn board_names(&self) -> Vec<String> {
+        let mut names = store::list_boards(&self.cfg.storage_path).unwrap_or_default();
+        if !names.contains(&self.board) {
+            names.push(self.board.clone());
+            names.sort();
+        }
+        names
+    }
+
+    fn open_boards(&mut self) {
+        let names = self.board_names();
+        let sel = names.iter().position(|n| *n == self.board).unwrap_or(0);
+        self.mode = Mode::Boards { names, sel };
+    }
+
+    fn on_boards_key(&mut self, code: KeyCode) {
+        self.status = None;
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Mode::Boards { names, sel } = &mut self.mode {
+                    *sel = move_selection(*sel, names.len(), 1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Mode::Boards { names, sel } = &mut self.mode {
+                    *sel = move_selection(*sel, names.len(), -1);
+                }
+            }
+            KeyCode::Enter => {
+                if let Mode::Boards { names, sel } = &self.mode {
+                    self.switch_board(names[*sel].clone());
+                }
+            }
+            KeyCode::Char('a') => {
+                self.clear_input();
+                self.mode = Mode::AddBoard;
+            }
+            KeyCode::Char('r') => {
+                let old = match &self.mode {
+                    Mode::Boards { names, sel } => names.get(*sel).cloned(),
+                    _ => None,
+                };
+                if let Some(old) = old {
+                    self.set_input(old.clone());
+                    self.mode = Mode::RenameBoard { old };
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Delete => {
+                let name = match &self.mode {
+                    Mode::Boards { names, sel } => names.get(*sel).cloned(),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    match board_deletable(&name, &self.board, self.board_names().len()) {
+                        Ok(()) => self.mode = Mode::ConfirmDeleteBoard { name },
+                        Err(e) => self.status = Some(e.into()),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_confirm_delete_board_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Mode::ConfirmDeleteBoard { name } = &self.mode {
+                    self.delete_board(name.clone());
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') | KeyCode::Esc => {
+                self.open_boards()
+            }
+            _ => {}
+        }
+    }
+
+    /// Delete a board's file and drop any config override. Guarded upstream
+    /// (`board_deletable`), so it never removes the active or only board.
+    fn delete_board(&mut self, name: String) {
+        let path = store::board_path(&self.cfg.storage_path, &name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            self.status = Some(format!("delete failed: {e}"));
+        } else {
+            if self.cfg.boards.remove(&name).is_some() {
+                self.save_cfg();
+            }
+            self.status = Some(format!("deleted {name}"));
+        }
+        self.open_boards();
+    }
+
+    /// Rename a board: move its file, carry over any config override and the
+    /// active-board pointer, then reopen the picker.
+    fn rename_board(&mut self, old: String, new: String) {
+        let new = match model::normalize_board_name(&new) {
+            Ok(n) => n,
+            Err(e) => {
+                self.status = Some(e);
+                return;
+            }
+        };
+        if new == old {
+            self.open_boards();
+            return;
+        }
+        let to = store::board_path(&self.cfg.storage_path, &new);
+        if to.exists() {
+            self.status = Some(format!("board '{new}' already exists"));
+            return;
+        }
+        let from = store::board_path(&self.cfg.storage_path, &old);
+        if let Err(e) = std::fs::rename(&from, &to) {
+            self.status = Some(format!("rename failed: {e}"));
+            return;
+        }
+        if let Some(o) = self.cfg.boards.remove(&old) {
+            self.cfg.boards.insert(new.clone(), o);
+        }
+        if self.board == old {
+            self.board = new.clone();
+            self.cfg.active_board = new.clone();
+        }
+        self.save_cfg();
+        self.status = Some(format!("renamed to {new}"));
+        self.open_boards();
+    }
+
+    /// Load a board's tasks and make it active (persisted). Per-mutation saves
+    /// mean there's nothing to flush for the board we're leaving.
+    fn switch_board(&mut self, name: String) {
+        let path = store::board_path(&self.cfg.storage_path, &name);
+        match store::load(&path) {
+            Ok(tasks) => {
+                self.tasks = tasks;
+                self.board = name.clone();
+                self.cfg.active_board = name.clone();
+                self.theme = Theme::named(&self.ecfg().theme);
+                self.selected = 0;
+                self.expanded.clear();
+                self.view = View::Active;
+                self.mode = Mode::Normal;
+                self.save_cfg();
+                self.status = Some(format!("switched to {name}"));
+            }
+            Err(e) => self.status = Some(format!("load failed: {e}")),
+        }
+    }
+
+    fn create_board(&mut self, name: String) {
+        let name = match model::normalize_board_name(&name) {
+            Ok(n) => n,
+            Err(e) => {
+                self.status = Some(e);
+                return;
+            }
+        };
+        let path = store::board_path(&self.cfg.storage_path, &name);
+        if path.exists() {
+            self.status = Some(format!("board '{name}' already exists"));
+            return;
+        }
+        if let Err(e) = store::save(&path, &[]) {
+            self.status = Some(format!("save failed: {e}"));
+            return;
+        }
+        self.switch_board(name);
     }
 
     fn on_input_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -396,11 +698,11 @@ impl App {
         let len = self.input.chars().count();
         match code {
             KeyCode::Esc => {
-                self.mode = if matches!(self.mode, Mode::EditCfg(_)) {
-                    Mode::Config
-                } else {
-                    Mode::Normal
-                };
+                match self.mode {
+                    Mode::EditCfg(_) => self.mode = Mode::Config,
+                    Mode::AddBoard | Mode::RenameBoard { .. } => self.open_boards(),
+                    _ => self.mode = Mode::Normal,
+                }
                 self.clear_input();
             }
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
@@ -441,10 +743,10 @@ impl App {
                 let Mode::EditCfg(f) = self.mode else {
                     unreachable!()
                 };
-                match apply_cfg(&self.cfg, f, &self.input) {
+                match apply_cfg(&self.cfg, &self.board, self.cfg_scope, f, &self.input) {
                     Ok(next) => {
                         self.cfg = next;
-                        self.theme = Theme::named(&self.cfg.theme); // live theme switch
+                        self.theme = Theme::named(&self.ecfg().theme); // live theme switch
                         self.save_cfg();
                         self.mode = Mode::Config;
                         self.clear_input();
@@ -459,6 +761,15 @@ impl App {
                 if let Mode::EditTags(id) = self.mode {
                     self.apply_tags(id, title);
                     self.persist();
+                } else if let Mode::AddBoard = self.mode {
+                    self.create_board(title); // sets its own mode; persists per-board
+                    self.clear_input();
+                    return;
+                } else if let Mode::RenameBoard { old } = &self.mode {
+                    let old = old.clone();
+                    self.rename_board(old, title);
+                    self.clear_input();
+                    return;
                 } else if !title.is_empty() {
                     match self.mode {
                         Mode::Add => self.add_task(title),
@@ -472,7 +783,11 @@ impl App {
                         | Mode::Config
                         | Mode::EditCfg(_)
                         | Mode::EditTags(_)
-                        | Mode::Search => {}
+                        | Mode::Search
+                        | Mode::Boards { .. }
+                        | Mode::AddBoard
+                        | Mode::RenameBoard { .. }
+                        | Mode::ConfirmDeleteBoard { .. } => {}
                     }
                     self.persist();
                 }
@@ -675,7 +990,8 @@ impl App {
     }
 
     fn persist(&mut self) {
-        if let Err(e) = store::save(&self.cfg.storage_path, &self.tasks) {
+        let path = store::board_path(&self.cfg.storage_path, &self.board);
+        if let Err(e) = store::save(&path, &self.tasks) {
             self.status = Some(format!("save failed: {e}"));
         }
     }
@@ -705,7 +1021,7 @@ impl App {
             })
             .collect();
         lines.push(Line::from(
-            "« zymosis — fermenting todo »"
+            format!("« zymosis — {} »", self.board)
                 .fg(self.theme.accent)
                 .add_modifier(Modifier::ITALIC),
         ));
@@ -714,7 +1030,7 @@ impl App {
 
     fn draw(&self, f: &mut Frame) {
         let now = model::now();
-        let th = self.cfg.thresholds();
+        let th = self.ecfg().thresholds();
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(BANNER.len() as u16 + 1),
             Constraint::Min(1),
@@ -728,6 +1044,17 @@ impl App {
             self.draw_help(f, body);
         } else if matches!(self.mode, Mode::Config | Mode::EditCfg(_)) {
             self.draw_config(f, body);
+        } else if matches!(
+            self.mode,
+            Mode::Boards { .. }
+                | Mode::AddBoard
+                | Mode::RenameBoard { .. }
+                | Mode::ConfirmDeleteBoard { .. }
+        ) {
+            self.draw_boards(f, body);
+            if let Mode::ConfirmDeleteBoard { name } = &self.mode {
+                self.draw_confirm(f, body, &format!("Delete board '{name}'?"));
+            }
         } else {
             let rows = self.rows();
             let items: Vec<ListItem> = rows
@@ -831,6 +1158,8 @@ impl App {
             Mode::EditSub(..) => Some("edit subtask> ".to_string()),
             Mode::EditNote(..) => Some("edit note> ".to_string()),
             Mode::EditTags(_) => Some("tags> ".to_string()),
+            Mode::AddBoard => Some("new board> ".to_string()),
+            Mode::RenameBoard { .. } => Some("rename> ".to_string()),
             Mode::Search => Some("/".to_string()),
             Mode::EditCfg(f) if self.status.is_none() => {
                 Some(format!("{}> ", CFG_FIELDS[cfg_field_index(f)].1))
@@ -852,13 +1181,18 @@ impl App {
             },
             Mode::Config => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
-                None => Line::from("↑↓ select · enter edit · esc back".dim()),
+                None => Line::from("↑↓ select · tab scope · enter edit · esc back".dim()),
             },
+            Mode::Boards { .. } => match &self.status {
+                Some(msg) => Line::from(msg.clone().fg(Color::Red)),
+                None => Line::from("enter switch · a add · r rename · x delete · esc close".dim()),
+            },
+            Mode::ConfirmDeleteBoard { .. } => Line::from("y confirm · n/esc cancel".dim()),
             Mode::Help => Line::from("any key to close".dim()),
             Mode::Normal => match &self.status {
                 Some(msg) => Line::from(msg.clone().fg(Color::Red)),
                 None => Line::from(
-                    "? help · a add · e edit · y yank · space done · tab view · q quit".dim(),
+                    "? help · a add · e edit · b boards · space done · tab view · q quit".dim(),
                 ),
             },
             // Text-input modes returned early above with the cursor drawn.
@@ -906,7 +1240,8 @@ impl App {
             Line::from(""),
             head("other"),
             key("y", "yank selected to clipboard"),
-            key("c", "config"),
+            key("b", "boards (switch / add)"),
+            key("c", "config (tab: global/board scope)"),
             key("?", "this help"),
             key("q/esc", "quit"),
         ];
@@ -917,12 +1252,39 @@ impl App {
     }
 
     fn draw_config(&self, f: &mut Frame, body: ratatui::layout::Rect) {
+        let [head, list_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(body);
+        let scope = match self.cfg_scope {
+            Scope::Global => "scope: global".to_string(),
+            Scope::Board => format!("scope: board {}", self.board),
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(scope.fg(self.theme.accent))),
+            head,
+        );
+
+        let ecfg = self.ecfg();
+        let over = self.cfg.boards.get(&self.board);
         let items: Vec<ListItem> = CFG_FIELDS
             .iter()
             .map(|(field, label)| {
+                let (value, suffix) = match self.cfg_scope {
+                    Scope::Global => (cfg_value(&self.cfg, *field), ""),
+                    Scope::Board if *field == CfgField::TickFps => {
+                        (cfg_value(&self.cfg, *field), " (global)")
+                    }
+                    Scope::Board => {
+                        let set = over.is_some_and(|o| override_is_set(o, *field));
+                        (
+                            cfg_value(&ecfg, *field),
+                            if set { " (override)" } else { "" },
+                        )
+                    }
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{label:14}"), Style::default().fg(self.theme.tag)),
-                    Span::raw(cfg_value(&self.cfg, *field)),
+                    Span::raw(value),
+                    Span::styled(suffix, Style::default().fg(self.theme.dormant)),
                 ]))
             })
             .collect();
@@ -936,7 +1298,61 @@ impl App {
                     .fg(self.theme.accent)
                     .add_modifier(Modifier::REVERSED),
             );
+        f.render_stateful_widget(list, list_area, &mut state);
+    }
+
+    fn draw_boards(&self, f: &mut Frame, body: ratatui::layout::Rect) {
+        let names = self.board_names();
+        let sel = match self.mode {
+            Mode::Boards { sel, .. } => sel,
+            _ => names.iter().position(|n| *n == self.board).unwrap_or(0),
+        };
+        let items: Vec<ListItem> = names
+            .iter()
+            .map(|n| {
+                let mark = if *n == self.board { "* " } else { "  " };
+                ListItem::new(Line::from(format!("{mark}{n}")))
+            })
+            .collect();
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(sel.min(items.len() - 1)));
+        }
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(" boards "))
+            .highlight_symbol("▶ ")
+            .highlight_style(
+                Style::default()
+                    .fg(self.theme.accent)
+                    .add_modifier(Modifier::REVERSED),
+            );
         f.render_stateful_widget(list, body, &mut state);
+    }
+
+    /// Centered yes/no confirmation popup over `area`.
+    fn draw_confirm(&self, f: &mut Frame, area: Rect, question: &str) {
+        let w = (question.chars().count() as u16 + 4).clamp(24, area.width.max(1));
+        let h = 4.min(area.height.max(1));
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, rect);
+        let body = vec![
+            Line::from(question.to_string()),
+            Line::from("y: yes   n: no".fg(self.theme.dormant)),
+        ];
+        f.render_widget(
+            Paragraph::new(body).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" confirm ")
+                    .border_style(Style::default().fg(self.theme.hot)),
+            ),
+            rect,
+        );
     }
 }
 
@@ -999,6 +1415,18 @@ fn base64(data: &[u8]) -> String {
         });
     }
     out
+}
+
+/// Whether `name` may be deleted, mirroring the CLI's guards: never the active
+/// board, never the last remaining one.
+fn board_deletable(name: &str, active: &str, total: usize) -> Result<(), &'static str> {
+    if name == active {
+        Err("cannot delete the active board")
+    } else if total <= 1 {
+        Err("cannot delete the only board")
+    } else {
+        Ok(())
+    }
 }
 
 fn move_selection(cur: usize, len: usize, delta: i32) -> usize {
@@ -1379,6 +1807,13 @@ mod tests {
     }
 
     #[test]
+    fn board_deletable_guards_active_and_last() {
+        assert!(board_deletable("work", "default", 2).is_ok());
+        assert!(board_deletable("default", "default", 2).is_err()); // active
+        assert!(board_deletable("only", "default", 1).is_err()); // last board
+    }
+
+    #[test]
     fn selection_clamps_to_bounds() {
         assert_eq!(move_selection(0, 0, 1), 0);
         assert_eq!(move_selection(0, 3, -1), 0);
@@ -1561,33 +1996,53 @@ mod tests {
         );
     }
 
+    fn global(cfg: &Config, f: CfgField, input: &str) -> Result<Config, String> {
+        apply_cfg(cfg, "default", Scope::Global, f, input)
+    }
+
     #[test]
     fn apply_cfg_theme_validates_name_and_switches() {
         let cfg = Config::default();
         assert_eq!(
-            apply_cfg(&cfg, CfgField::Theme, "neon_teal").unwrap().theme,
+            global(&cfg, CfgField::Theme, "neon_teal").unwrap().theme,
             "neon_teal"
         );
-        assert!(apply_cfg(&cfg, CfgField::Theme, "nope").is_err());
+        assert!(global(&cfg, CfgField::Theme, "nope").is_err());
     }
 
     #[test]
     fn apply_cfg_parses_validates_and_rejects() {
         let cfg = Config::default();
         // valid span edit round-trips through the human format
-        let next = apply_cfg(&cfg, CfgField::HotWindow, "1d").unwrap();
+        let next = global(&cfg, CfgField::HotWindow, "1d").unwrap();
         assert_eq!(next.hot_window.as_human(), "1d");
         // tick_fps parses as a number
-        assert_eq!(
-            apply_cfg(&cfg, CfgField::TickFps, "30").unwrap().tick_fps,
-            30
-        );
+        assert_eq!(global(&cfg, CfgField::TickFps, "30").unwrap().tick_fps, 30);
         // garbage span and number are rejected
-        assert!(apply_cfg(&cfg, CfgField::HotWindow, "nope").is_err());
-        assert!(apply_cfg(&cfg, CfgField::TickFps, "x").is_err());
+        assert!(global(&cfg, CfgField::HotWindow, "nope").is_err());
+        assert!(global(&cfg, CfgField::TickFps, "x").is_err());
         // tick_fps must be >= 1, and hot_window must stay <= dormant_after
-        assert!(apply_cfg(&cfg, CfgField::TickFps, "0").is_err());
-        assert!(apply_cfg(&cfg, CfgField::HotWindow, "999d").is_err());
+        assert!(global(&cfg, CfgField::TickFps, "0").is_err());
+        assert!(global(&cfg, CfgField::HotWindow, "999d").is_err());
+    }
+
+    #[test]
+    fn apply_cfg_board_scope_sets_clears_and_validates() {
+        let cfg = Config::default();
+        // Board-scope edit records an override, leaving the global untouched.
+        let c = apply_cfg(&cfg, "work", Scope::Board, CfgField::HotWindow, "1d").unwrap();
+        assert_eq!(
+            c.boards["work"].hot_window,
+            Some(CfgSpan::parse("1d").unwrap())
+        );
+        assert_eq!(c.hot_window, cfg.hot_window);
+        // Empty input clears the override and drops the now-empty entry.
+        let c = apply_cfg(&c, "work", Scope::Board, CfgField::HotWindow, "").unwrap();
+        assert!(!c.boards.contains_key("work"));
+        // A board override that breaks hot_window <= dormant_after is rejected.
+        assert!(apply_cfg(&cfg, "work", Scope::Board, CfgField::HotWindow, "999d").is_err());
+        // tick_fps is not editable per-board.
+        assert!(apply_cfg(&cfg, "work", Scope::Board, CfgField::TickFps, "30").is_err());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::model::Task;
 
@@ -76,6 +76,49 @@ pub fn import(path: &Path) -> io::Result<Vec<Task>> {
     read_json(path)
 }
 
+/// The `boards/` directory beside the (legacy) store file.
+pub fn boards_dir(storage_path: &Path) -> PathBuf {
+    match storage_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join("boards"),
+        _ => PathBuf::from("boards"),
+    }
+}
+
+/// Path to a board's JSON file. `board` must already be normalized.
+pub fn board_path(storage_path: &Path, board: &str) -> PathBuf {
+    boards_dir(storage_path).join(format!("{board}.json"))
+}
+
+/// One-time, idempotent migration of the legacy single-file store into
+/// `boards/default.json`. Fires only when `boards/` is absent and the legacy
+/// file exists; a no-op otherwise.
+pub fn migrate_legacy(storage_path: &Path) -> io::Result<()> {
+    let dir = boards_dir(storage_path);
+    if dir.exists() || !storage_path.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(&dir)?;
+    fs::rename(storage_path, board_path(storage_path, "default"))
+}
+
+/// Sorted board names (file stems of `boards/*.json`). Missing dir → empty.
+pub fn list_boards(storage_path: &Path) -> io::Result<Vec<String>> {
+    let dir = boards_dir(storage_path);
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +182,54 @@ mod tests {
         let path = dir.path().join("tasks.json");
         fs::write(&path, "   \n").unwrap();
         assert!(load(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_moves_legacy_into_default_board_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("tasks.json");
+        save(&legacy, &[Task::new(1, "x")]).unwrap();
+
+        migrate_legacy(&legacy).unwrap();
+        assert!(!legacy.exists());
+        let moved = board_path(&legacy, "default");
+        assert_eq!(load(&moved).unwrap(), vec![Task::new(1, "x")]);
+
+        // Re-running is a no-op (boards/ now exists).
+        migrate_legacy(&legacy).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(load(&moved).unwrap(), vec![Task::new(1, "x")]);
+    }
+
+    #[test]
+    fn migrate_fresh_install_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("tasks.json");
+        migrate_legacy(&legacy).unwrap();
+        assert!(!boards_dir(&legacy).exists());
+    }
+
+    #[test]
+    fn migrate_leaves_stray_legacy_when_boards_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("tasks.json");
+        save(&legacy, &[Task::new(1, "x")]).unwrap();
+        fs::create_dir_all(boards_dir(&legacy)).unwrap();
+        migrate_legacy(&legacy).unwrap();
+        assert!(
+            legacy.exists(),
+            "legacy file left alone once boards/ exists"
+        );
+    }
+
+    #[test]
+    fn list_boards_sorted_and_empty_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("tasks.json");
+        assert!(list_boards(&legacy).unwrap().is_empty());
+        save(&board_path(&legacy, "work"), &[]).unwrap();
+        save(&board_path(&legacy, "default"), &[]).unwrap();
+        assert_eq!(list_boards(&legacy).unwrap(), vec!["default", "work"]);
     }
 
     #[test]

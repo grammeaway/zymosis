@@ -42,6 +42,28 @@ explicitly reviving it — resets it to **hot**. Marking it *done* does not.
   palette (swappable via `theme`), a decay colour ramp, gently pulsing hot
   tasks, and animated rising bubbles.
 
+## Boards
+
+A board is an independent task list — `work`, `home`, `side-project`, whatever
+you like. Everything above (lifecycle, subtasks, notes, tags) works per board;
+switching boards just swaps which list you're looking at. One board is always
+*active* (the default is literally named `default`), and that's what the CLI and
+TUI act on unless you say otherwise.
+
+- Each board is its own JSON file under `~/.local/share/zym/boards/`.
+- The active board is remembered in `config.toml` (`active_board`).
+- Boards can carry **overrides** — a board can run a shorter `hot_window` or a
+  different `theme` than the global config; anything not overridden is inherited.
+- Board names are lenient: any trimmed name works (spaces, capitals, unicode),
+  as long as it's usable as a filename (no `/` or `\`).
+
+**Migration is automatic.** The first time a newer `zym` runs against an older
+install, your existing `tasks.json` is moved to `boards/default.json` once — no
+action needed, and nothing is lost.
+
+In the CLI, `-b/--board <name>` targets a board for a single invocation; in the
+TUI, press `b` for the board picker.
+
 ## Install
 
 ### Building from source
@@ -79,10 +101,12 @@ your shell is looking, or an older copy is shadowing the new one.
 Data and config live in platform-standard locations (via `dirs`):
 
 - Config: `~/.config/zym/config.toml`
-- Tasks:  `~/.local/share/zym/tasks.json`
+- Tasks:  `~/.local/share/zym/boards/<board>.json` (one file per board)
 
 Saves are atomic (write-temp-then-rename), so a crash mid-write can't corrupt
-your list.
+your list. Older installs that predate boards keep a single
+`~/.local/share/zym/tasks.json`; it is migrated to `boards/default.json`
+automatically on first run.
 
 ## The TUI
 
@@ -102,9 +126,22 @@ Run `zym` with no arguments to launch the interactive interface.
 | `Space` / `d` | toggle done (task or highlighted subtask) |
 | `r` | revive (mark still-relevant → hot) |
 | `x` / `Del` | delete (task, or the highlighted subtask/note) |
-| `Tab` | show / hide dormant tasks |
+| `Tab` | cycle active → dormant → done |
+| `y` | yank the selected line to the clipboard |
+| `b` | open the board picker |
 | `c` | open the config screen |
 | `q` / `Esc` | quit |
+
+### Board picker (`b`)
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / `↑` / `↓` | move selection |
+| `Enter` | switch to the selected board |
+| `a` | add a new board (prompts for a name) |
+| `r` | rename the selected board |
+| `x` / `Del` | delete the selected board (asks to confirm; not the active or last board) |
+| `q` / `Esc` | close the picker |
 
 While typing (add / subtask / note / edit), the cursor is visible and the line
 scrolls to keep it on screen:
@@ -129,6 +166,11 @@ validated (same rules as the file) and written straight to
 `config.toml`; an invalid value shows an error and keeps your input for a retry.
 `storage_path` stays CLI-only, since changing it live would mean reloading the
 store.
+
+`Tab` toggles the edit **scope** between *global* (the shared config) and
+*board* (overrides for the active board). In board scope, fields marked
+`(override)` diverge from the global value; editing one sets the override, and
+saving an empty value clears it back to inherited. `tick_fps` is global-only.
 
 ## The CLI
 
@@ -162,6 +204,15 @@ zym note rm 1 2
 zym tag add 1 monitoring
 zym tag rm 1 monitoring
 
+# boards (independent task lists; the active board is remembered in config)
+zym board list                   # list boards; the active one is marked with *
+zym board add work               # create an empty board
+zym board use work               # switch the active board (persisted)
+zym board rename work planning    # rename (moves its file + any overrides)
+zym board rm work                # delete a board (alias: `delete`); not active/last
+zym -b work list                 # act on a specific board for one command
+zym -b work add "ship it"         # -b/--board works on any task command
+
 # data
 zym export tasks-backup.json
 zym import tasks-backup.json     # appends; ids are reassigned
@@ -189,14 +240,27 @@ dormant_after = "2w"     # older than this → dormant (hidden)
 bubble_after  = "30d"    # dormant this much longer → bubbling
 storage_path  = "/home/you/.local/share/zym/tasks.json"
 tick_fps      = 12        # TUI animation cap
-theme         = "neon_purple"  # color theme; also: "neon_teal"
+theme         = "neon_purple"  # color theme
+active_board  = "default"      # which board the CLI/TUI act on by default
+
+# Optional per-board overrides. Anything omitted is inherited from above.
+[boards.work]
+hot_window = "1d"
+theme      = "neon_teal"
 ```
 
-`hot_window` must be `<= dormant_after`; the app validates this on load. An
-unknown `theme` name falls back to the default, so the file always loads.
+Themes: `neon_purple` (default), `neon_teal`, `catppuccin_mocha`,
+`catppuccin_macchiato`, `catppuccin_frappe`, `catppuccin_latte`. An unknown
+`theme` name falls back to the default, so the file always loads.
 
-Everything here except `storage_path` is also editable in the TUI's config
-screen (press `c`) — see [The TUI](#the-tui).
+`storage_path` still points at the legacy `tasks.json` path; boards live in a
+`boards/` directory beside it. `hot_window` must be `<= dormant_after` — globally
+and for each board's *effective* (overrides-applied) values; the app validates
+this on load.
+
+Everything except `storage_path` is also editable in the TUI's config screen
+(press `c`), including per-board overrides via the scope toggle — see
+[The TUI](#the-tui).
 
 ## Built with
 
@@ -218,6 +282,7 @@ here is an independent TUI reimagining of that concept.
   the top.
 - Tags are freeform — no typo protection (`perf` and `performance` are distinct).
 - Storage is a JSON file. SQLite may come later if a feature needs it.
+- Tasks can't yet be moved between boards; `-b` targets one board per command.
 
 ## AI Usage Disclosure
 This project was developed leveraging agentic coding assistants, to amplify the speed of development. The primary model used was Claude Opus 4.8, through the Pi agentic harness.
