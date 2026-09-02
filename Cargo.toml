@@ -1,6 +1,6 @@
 [package]
 name = "zymosis"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 description = "A terminal todo list where stale tasks ferment and resurface instead of rotting in a flat list."
 license = "MIT OR Apache-2.0"
