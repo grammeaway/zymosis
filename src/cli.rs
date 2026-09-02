@@ -57,6 +57,8 @@ pub enum Command {
     },
     /// Mark a task still-relevant, reviving it to Hot.
     Revive { id: u64 },
+    /// Shelve a task straight to Dormant, to ferment back later.
+    Dormant { id: u64 },
     /// Delete a task.
     Rm { id: u64 },
     /// Export all tasks to a JSON file.
@@ -442,6 +444,11 @@ pub fn run(cli: Cli) -> Result<(), String> {
             find_mut(&mut tasks, id)?.touch();
             store::save(&store_path, &tasks).map_err(io_err)?;
             println!("revived task {id}");
+        }
+        Command::Dormant { id } => {
+            find_mut(&mut tasks, id)?.make_dormant(&ecfg.thresholds(), now);
+            store::save(&store_path, &tasks).map_err(io_err)?;
+            println!("shelved task {id} to dormant");
         }
         Command::Rm { id } => {
             let before = tasks.len();

@@ -36,6 +36,7 @@ explicitly reviving it — resets it to **hot**. Marking it *done* does not.
 - **Tags / categories** (freeform, e.g. `monitoring`, `perf`, `org`) with tag filtering.
 - Time-based **hot / decaying / dormant / bubbling** lifecycle, fully configurable.
 - **Revive** dormant tasks, or let bubbling surface them for you.
+- **Shelve** a task straight to dormant (`D` / `zym dormant`) when you know it's not for now — let fermentation resurface it. Also dismisses a bubbling task back to dormancy.
 - **Export / import** to JSON for sharing or backup.
 - A **CLI** mirroring every operation, so scripts and agentic tools can drive it.
 - A **TUI** with lo-fi juice: a neon-punk block-letter banner, a purple-forward
@@ -125,6 +126,7 @@ Run `zym` with no arguments to launch the interactive interface.
 | `Enter` / `→` | expand / collapse subtasks + notes |
 | `Space` / `d` | toggle done (task or highlighted subtask) |
 | `r` | revive (mark still-relevant → hot) |
+| `D` | shelve to dormant (dismiss to ferment back later) |
 | `x` / `Del` | delete (task, or the highlighted subtask/note) |
 | `Tab` | cycle active → dormant → done |
 | `y` | yank the selected line to the clipboard |
@@ -189,6 +191,7 @@ zym show 1                       # task detail with indexed subtasks, notes + ta
 zym done 1                       # mark complete
 zym edit 1 --title "..."
 zym revive 1                     # still-relevant → hot
+zym dormant 1                    # shelve straight to dormant
 zym rm 1
 
 # subtasks (index is 1-based, as shown by `zym show`)

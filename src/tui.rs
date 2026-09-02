@@ -461,6 +461,11 @@ impl App {
                     self.persist();
                 }
             }
+            KeyCode::Char('D') => {
+                if self.dormant_selected() {
+                    self.persist();
+                }
+            }
             KeyCode::Char('c') => {
                 self.cfg_sel = 0;
                 self.cfg_scope = Scope::Global;
@@ -952,6 +957,21 @@ impl App {
         }
     }
 
+    /// Shelve the highlighted task straight to Dormant (or dismiss a Bubbling
+    /// one back down), leaving it to ferment back up.
+    fn dormant_selected(&mut self) -> bool {
+        let th = self.ecfg().thresholds();
+        match self.selected_task() {
+            Some(ti) => {
+                self.tasks[ti].make_dormant(&th, model::now());
+                let id = self.tasks[ti].id;
+                self.select_task(id);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Delete the highlighted row: a task (with its subtasks), or a single
     /// subtask (touching its parent).
     fn remove_selected(&mut self) -> bool {
@@ -1224,6 +1244,7 @@ impl App {
             key("t", "edit tags"),
             key("space/d", "toggle done"),
             key("r", "revive (from dormant/done)"),
+            key("D", "shelve to dormant"),
             key("x/del", "delete"),
             Line::from(""),
             head("subtasks & notes"),
@@ -2085,6 +2106,17 @@ mod tests {
         assert!(app.revive_selected());
         assert!(!app.tasks[0].done);
         app.view = View::Active;
+        assert_eq!(app.visible(), vec![0]);
+    }
+
+    #[test]
+    fn shelve_moves_active_task_to_dormant_view() {
+        let mut app = app_with(1); // one fresh (Hot) task
+        assert!(matches!(app.view, View::Active));
+        assert_eq!(app.visible(), vec![0]);
+        assert!(app.dormant_selected());
+        assert!(app.visible().is_empty()); // gone from Active
+        app.view = View::Dormant;
         assert_eq!(app.visible(), vec![0]);
     }
 }

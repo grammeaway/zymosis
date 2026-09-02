@@ -170,6 +170,13 @@ impl Task {
         self.last_updated = now();
     }
 
+    /// Shelve deliberately: backdate `last_updated` to the start of the Dormant
+    /// band so the task drops out of sight, then ferments back toward Bubbling.
+    /// Also the way to dismiss a Bubbling task back to Dormant.
+    pub fn make_dormant(&mut self, t: &Thresholds, now_ts: Timestamp) {
+        self.last_updated = now_ts.saturating_sub(t.dormant_after.as_secs());
+    }
+
     /// Age at reference time `now_ts`. Saturates so a clock that briefly runs
     /// backwards yields age 0 rather than underflowing.
     pub fn age(&self, now_ts: Timestamp) -> Duration {
@@ -272,6 +279,15 @@ mod tests {
             task.last_updated = 0; // pretend it went stale
             task.touch();
             prop_assert_eq!(task.status(&t, task.last_updated), Status::Hot);
+        }
+
+        /// Shelving drops a task to at least Dormant from any prior age (exactly
+        /// Dormant whenever a Dormant band exists, i.e. bubble_after > 0).
+        #[test]
+        fn make_dormant_shelves(t in thresholds(), now in 0u64..1_000_000) {
+            let mut task = Task::new(1, "x");
+            task.make_dormant(&t, now);
+            prop_assert!(rank(task.status(&t, now)) >= rank(Status::Dormant));
         }
 
         /// More age never yields a hotter (lower-ranked) band.
