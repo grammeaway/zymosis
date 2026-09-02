@@ -38,6 +38,8 @@ enum Mode {
     Help,
     Add,
     Edit(u64),
+    EditSub(u64, usize),
+    EditNote(u64, usize),
     AddSub(u64),
     AddNote(u64),
     EditTags(u64),
@@ -324,12 +326,21 @@ impl App {
                     self.mode = Mode::AddNote(self.tasks[ti].id);
                 }
             }
-            KeyCode::Char('e') => {
-                if let Some(i) = self.selected_task() {
-                    self.set_input(self.tasks[i].title.clone());
-                    self.mode = Mode::Edit(self.tasks[i].id);
+            KeyCode::Char('e') => match self.selected_row() {
+                Some(Row::Task(ti)) => {
+                    self.set_input(self.tasks[ti].title.clone());
+                    self.mode = Mode::Edit(self.tasks[ti].id);
                 }
-            }
+                Some(Row::Sub(ti, si)) => {
+                    self.set_input(self.tasks[ti].subtasks[si].title.clone());
+                    self.mode = Mode::EditSub(self.tasks[ti].id, si);
+                }
+                Some(Row::Note(ti, ni)) => {
+                    self.set_input(self.tasks[ti].notes[ni].text.clone());
+                    self.mode = Mode::EditNote(self.tasks[ti].id, ni);
+                }
+                None => {}
+            },
             KeyCode::Char('t') => {
                 if let Some(i) = self.selected_task() {
                     self.set_input(self.tasks[i].tags.join(" "));
@@ -452,6 +463,8 @@ impl App {
                     match self.mode {
                         Mode::Add => self.add_task(title),
                         Mode::Edit(id) => self.apply_edit(id, title),
+                        Mode::EditSub(id, si) => self.apply_edit_sub(id, si, title),
+                        Mode::EditNote(id, ni) => self.apply_edit_note(id, ni, title),
                         Mode::AddSub(id) => self.add_subtask(id, title),
                         Mode::AddNote(id) => self.add_note(id, title),
                         Mode::Normal
@@ -527,6 +540,26 @@ impl App {
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
             t.title = title;
             t.touch();
+        }
+        self.select_task(id);
+    }
+
+    fn apply_edit_sub(&mut self, id: u64, si: usize, title: String) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+            if let Some(s) = t.subtasks.get_mut(si) {
+                s.title = title;
+                t.touch();
+            }
+        }
+        self.select_task(id);
+    }
+
+    fn apply_edit_note(&mut self, id: u64, ni: usize, text: String) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+            if let Some(n) = t.notes.get_mut(ni) {
+                n.text = text;
+                t.touch();
+            }
         }
         self.select_task(id);
     }
@@ -795,6 +828,8 @@ impl App {
             Mode::AddSub(_) => Some("subtask> ".to_string()),
             Mode::AddNote(_) => Some("note> ".to_string()),
             Mode::Edit(_) => Some("edit> ".to_string()),
+            Mode::EditSub(..) => Some("edit subtask> ".to_string()),
+            Mode::EditNote(..) => Some("edit note> ".to_string()),
             Mode::EditTags(_) => Some("tags> ".to_string()),
             Mode::Search => Some("/".to_string()),
             Mode::EditCfg(f) if self.status.is_none() => {
@@ -1416,6 +1451,21 @@ mod tests {
         assert_eq!(app.tasks[0].subtasks.len(), 1);
         assert!(app.expanded.contains(&id)); // auto-revealed
         assert_eq!(app.rows().len(), 2); // task + 1 subtask
+    }
+
+    #[test]
+    fn edit_targets_the_selected_subtask_and_note_row() {
+        let mut app = app_with(1);
+        let id = app.tasks[0].id;
+        app.add_subtask(id, "old sub".into());
+        app.add_note(id, "old note".into());
+
+        app.apply_edit_sub(id, 0, "new sub".into());
+        assert_eq!(app.tasks[0].subtasks[0].title, "new sub");
+        app.apply_edit_note(id, 0, "new note".into());
+        assert_eq!(app.tasks[0].notes[0].text, "new note");
+        // task title untouched by subtask/note edits
+        assert_eq!(app.tasks[0].title, "t0");
     }
 
     #[test]
