@@ -12,7 +12,10 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableFocusChange, EnableFocusChange, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
+use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -30,7 +33,9 @@ pub fn run() -> Result<(), String> {
     let tasks = store::load(&path).map_err(|e| e.to_string())?;
     let mut app = App::new(cfg, tasks);
     let mut term = ratatui::try_init().map_err(|e| format!("no terminal available: {e}"))?;
+    let _ = execute!(std::io::stdout(), EnableFocusChange);
     let res = app.run(&mut term);
+    let _ = execute!(std::io::stdout(), DisableFocusChange);
     let _ = ratatui::try_restore();
     res
 }
@@ -243,6 +248,7 @@ struct App {
     cfg_scope: Scope,
     g_pending: bool, // saw a lone `g`, waiting for the second in `gg`
     frame: u64,
+    focused: bool, // animations pause while the terminal is unfocused
     quit: bool,
 }
 
@@ -266,6 +272,7 @@ impl App {
             cfg_scope: Scope::Global,
             g_pending: false,
             frame: 0,
+            focused: true,
             quit: false,
         }
     }
@@ -359,8 +366,13 @@ impl App {
                 dirty = false;
             }
             if event::poll(tick).map_err(|e| e.to_string())? {
-                if let Event::Key(k) = event::read().map_err(|e| e.to_string())? {
-                    if k.kind == KeyEventKind::Press {
+                match event::read().map_err(|e| e.to_string())? {
+                    Event::FocusGained => {
+                        self.focused = true;
+                        dirty = true;
+                    }
+                    Event::FocusLost => self.focused = false,
+                    Event::Key(k) if k.kind == KeyEventKind::Press => {
                         match self.mode {
                             Mode::Normal => self.on_normal_key(k.code),
                             Mode::Help => self.mode = Mode::Normal, // any key closes help
@@ -373,8 +385,9 @@ impl App {
                         }
                         dirty = true;
                     }
+                    _ => {}
                 }
-            } else {
+            } else if self.focused {
                 self.frame = self.frame.wrapping_add(1);
                 if self.has_animation() {
                     dirty = true;
